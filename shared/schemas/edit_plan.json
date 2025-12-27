@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EditPlan",
+  "type": "object",
+  "properties": {
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["intro", "body", "outro"] },
+          "target_duration": { "type": "integer" },
+          "events": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": { "const": "clip" },
+                    "asset_id": { "type": "integer" },
+                    "in_ticks": { "type": "integer" },
+                    "out_ticks": { "type": "integer" },
+                    "timeline_start_ticks": { "type": "integer" },
+                    "track_id": { "type": "integer" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": { "const": "caption" },
+                    "text": { "type": "string" },
+                    "template_id": { "type": "integer" },
+                    "start_ticks": { "type": "integer" },
+                    "end_ticks": { "type": "integer" }
+                  }
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": { "const": "music" },
+                    "track_path": { "type": "string" },
+                    "ducking_profile_id": { "type": "integer" },
+                    "start_ticks": { "type": "integer" },
+                    "end_ticks": { "type": "integer" }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "properties": {
+        "target_length": { "type": "integer" },
+        "vibe": { "type": "string" },
+        "captions_on": { "type": "boolean" },
+        "music_on": { "type": "boolean" }
+      }
+    },
+    "model_versions": {
+      "type": "object",
+      "description": "Versions of models used in generation"
+    }
+  }
+}

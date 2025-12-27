@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+faster-whisper==1.0.3
+opencv-python==4.10.0
+numpy==1.26.0
+pytesseract==0.3.13
+scipy==1.13.0

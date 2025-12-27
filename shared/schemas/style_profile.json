@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StyleProfile",
+  "type": "object",
+  "properties": {
+    "pacing": {
+      "type": "object",
+      "properties": {
+        "intro_clip_length_target": { "type": "number" },
+        "body_clip_length_target": { "type": "number" },
+        "outro_clip_length_target": { "type": "number" },
+        "silence_tolerance": { "type": "number" },
+        "cut_aggressiveness": { "type": "number" }
+      }
+    },
+    "caption_templates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "placement": {
+            "type": "object",
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "safe_area": { "type": "boolean" }
+            }
+          },
+          "font_family": { "type": "string" },
+          "font_weight": { "type": "string" },
+          "font_size": { "type": "number" },
+          "stroke": { "type": "boolean" },
+          "shadow": { "type": "boolean" }
+        }
+      }
+    },
+    "music": {
+      "type": "object",
+      "properties": {
+        "ducking_profile": {
+          "type": "object",
+          "properties": {
+            "duck_amount": { "type": "number" },
+            "fade_in": { "type": "number" },
+            "fade_out": { "type": "number" }
+          }
+        },
+        "loudness_curve": { "type": "array", "items": { "type": "number" } },
+        "bpm_tendencies": { "type": "array", "items": { "type": "number" } }
+      }
+    },
+    "structure": {
+      "type": "object",
+      "properties": {
+        "a_roll_b_roll_ratio": { "type": "number" },
+        "intro_duration_target": { "type": "number" },
+        "outro_duration_target": { "type": "number" }
+      }
+    },
+    "embedding_model_version": {
+      "type": "string",
+      "description": "Version of embedding model used"
+    }
+  }
+}

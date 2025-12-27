@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Timeline",
+  "type": "object",
+  "properties": {
+    "settings": {
+      "type": "object",
+      "properties": {
+        "fps": { "type": "number" },
+        "resolution": {
+          "type": "object",
+          "properties": {
+            "width": { "type": "integer" },
+            "height": { "type": "integer" }
+          }
+        },
+        "sample_rate": { "type": "integer" },
+        "ticks_per_second": { "type": "integer", "const": 48000 }
+      }
+    },
+    "tracks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "kind": { "type": "string", "enum": ["Video", "Audio", "Caption"] },
+          "clips": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "asset_id": { "type": "integer" },
+                "in_ticks": { "type": "integer" },
+                "out_ticks": { "type": "integer" },
+                "timeline_start_ticks": { "type": "integer" },
+                "speed": { "type": "number", "default": 1.0 },
+                "track_id": { "type": "integer" }
+              },
+              "required": ["asset_id", "in_ticks", "out_ticks", "timeline_start_ticks", "track_id"]
+            }
+          }
+        },
+        "required": ["id", "kind", "clips"]
+      }
+    },
+    "captions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start_ticks": { "type": "integer" },
+          "end_ticks": { "type": "integer" },
+          "text": { "type": "string" },
+          "template_id": { "type": "integer" }
+        },
+        "required": ["start_ticks", "end_ticks", "text"]
+      }
+    },
+    "music": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start_ticks": { "type": "integer" },
+          "end_ticks": { "type": "integer" },
+          "track_path": { "type": "string" },
+          "ducking_profile_id": { "type": "integer" }
+        },
+        "required": ["start_ticks", "end_ticks", "track_path"]
+      }
+    },
+    "markers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "position_ticks": { "type": "integer" },
+          "label": { "type": "string" }
+        }
+      }
+    }
+  },
+  "required": ["settings", "tracks", "captions", "music", "markers"]
+}

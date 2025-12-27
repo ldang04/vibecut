@@ -1,0 +1,17 @@
+cat > .gitignore <<'EOF'
+# Node
+node_modules
+dist
+out
+
+# Rust
+target
+
+# Python
+.venv
+__pycache__/
+*.pyc
+
+# App data
+.cache/
+EOF
