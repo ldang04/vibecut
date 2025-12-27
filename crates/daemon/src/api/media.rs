@@ -55,6 +55,7 @@ pub fn router(db: Arc<Database>, job_manager: Arc<JobManager>) -> Router {
     Router::new()
         .route("/:id/import_raw", post(import_raw))
         .route("/:id/media", get(list_media))
+        .route("/:id/references", get(list_references))
         .route("/:id/media/:asset_id", delete(delete_media_asset))
         .route("/:id/media/:asset_id/proxy", get(get_proxy_file))
         .route("/proxy/:asset_id", get(get_proxy_file_legacy)) // Legacy route for compatibility
@@ -65,9 +66,32 @@ async fn list_media(
     State((db, _job_manager)): State<(Arc<Database>, Arc<JobManager>)>,
     Path(project_id): Path<i64>,
 ) -> Result<Json<Vec<MediaAssetResponse>>, StatusCode> {
-    // Get media assets for this specific project
+    // Get media assets for this specific project (excluding references)
     let assets = db
         .get_media_assets_for_project(project_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    let response: Vec<MediaAssetResponse> = assets
+        .into_iter()
+        .map(|asset| MediaAssetResponse {
+            id: asset.id,
+            path: asset.path,
+            duration_ticks: asset.duration_ticks,
+            width: asset.width,
+            height: asset.height,
+        })
+        .collect();
+    
+    Ok(Json(response))
+}
+
+async fn list_references(
+    State((db, _job_manager)): State<(Arc<Database>, Arc<JobManager>)>,
+    Path(project_id): Path<i64>,
+) -> Result<Json<Vec<MediaAssetResponse>>, StatusCode> {
+    // Get reference assets for this specific project
+    let assets = db
+        .get_reference_assets_for_project(project_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
     let response: Vec<MediaAssetResponse> = assets
@@ -433,6 +457,7 @@ async fn process_single_file_import(
         &video_path,
         0,
         1, // Only one file in this job
+        false, // Not a reference
     )
     .await?;
 
@@ -449,6 +474,7 @@ async fn process_single_video(
     video_path: &PathBuf,
     idx: usize,
     total_files: usize,
+    is_reference: bool,
 ) -> anyhow::Result<()> {
     // Compute checksum
     let checksum: Option<String> = compute_file_checksum(video_path)
@@ -459,7 +485,7 @@ async fn process_single_video(
     let media_info = FFmpegWrapper::probe(video_path).await?;
 
     // Register media asset with project_id
-    let asset_id = db.create_media_asset(
+    let asset_id = db.create_media_asset_with_reference_flag(
         project_id,
         video_path.to_str().unwrap(),
         checksum.as_ref().map(|s| s.as_str()),
@@ -469,6 +495,7 @@ async fn process_single_video(
         media_info.width,
         media_info.height,
         media_info.has_audio,
+        is_reference,
     )?;
 
     // Queue proxy generation job
@@ -544,6 +571,7 @@ async fn process_import(
             video_path,
             idx,
             total_files,
+            false, // Not a reference
         )
         .await?;
     }

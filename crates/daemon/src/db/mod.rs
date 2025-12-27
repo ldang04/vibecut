@@ -97,6 +97,19 @@ impl Database {
             // If it has the old schema, we'd need to recreate, but this is complex to detect
             // For now, assume if project_id exists, the schema is correct
         }
+        
+        // Migration: Add is_reference column if it doesn't exist
+        let has_is_reference = conn
+            .prepare("SELECT is_reference FROM media_assets LIMIT 1")
+            .is_ok();
+        
+        if !has_is_reference {
+            // Add is_reference column with default value of 0 (not a reference)
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN is_reference INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proxies (
@@ -270,6 +283,24 @@ impl Database {
         height: i32,
         has_audio: bool,
     ) -> Result<i64> {
+        self.create_media_asset_with_reference_flag(
+            project_id, path, checksum, duration_ticks, fps_num, fps_den, width, height, has_audio, false,
+        )
+    }
+    
+    pub fn create_media_asset_with_reference_flag(
+        &self,
+        project_id: i64,
+        path: &str,
+        checksum: Option<&str>,
+        duration_ticks: i64,
+        fps_num: i32,
+        fps_den: i32,
+        width: i32,
+        height: i32,
+        has_audio: bool,
+        is_reference: bool,
+    ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         
         // Check if asset already exists for this project
@@ -283,17 +314,17 @@ impl Database {
             Ok(id) => {
                 // Update existing asset
                 conn.execute(
-                    "UPDATE media_assets SET checksum = ?1, duration_ticks = ?2, fps_num = ?3, fps_den = ?4, width = ?5, height = ?6, has_audio = ?7 WHERE id = ?8",
-                    params![checksum, duration_ticks, fps_num, fps_den, width, height, if has_audio { 1 } else { 0 }, id],
+                    "UPDATE media_assets SET checksum = ?1, duration_ticks = ?2, fps_num = ?3, fps_den = ?4, width = ?5, height = ?6, has_audio = ?7, is_reference = ?8 WHERE id = ?9",
+                    params![checksum, duration_ticks, fps_num, fps_den, width, height, if has_audio { 1 } else { 0 }, if is_reference { 1 } else { 0 }, id],
                 )?;
                 Ok(id)
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // Insert new asset
                 conn.execute(
-                    "INSERT INTO media_assets (project_id, path, checksum, duration_ticks, fps_num, fps_den, width, height, has_audio) 
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![project_id, path, checksum, duration_ticks, fps_num, fps_den, width, height, if has_audio { 1 } else { 0 }],
+                    "INSERT INTO media_assets (project_id, path, checksum, duration_ticks, fps_num, fps_den, width, height, has_audio, is_reference) 
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![project_id, path, checksum, duration_ticks, fps_num, fps_den, width, height, if has_audio { 1 } else { 0 }, if is_reference { 1 } else { 0 }],
                 )?;
                 Ok(conn.last_insert_rowid())
             }
@@ -414,7 +445,35 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, path, duration_ticks, fps_num, fps_den, width, height
              FROM media_assets
-             WHERE project_id = ?1 AND project_id IS NOT NULL
+             WHERE project_id = ?1 AND project_id IS NOT NULL AND (is_reference IS NULL OR is_reference = 0)
+             ORDER BY id DESC"
+        )?;
+        
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(MediaAssetInfo {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                duration_ticks: row.get(2)?,
+                fps_num: row.get(3)?,
+                fps_den: row.get(4)?,
+                width: row.get(5)?,
+                height: row.get(6)?,
+            })
+        })?;
+        
+        let mut assets = Vec::new();
+        for row in rows {
+            assets.push(row?);
+        }
+        Ok(assets)
+    }
+
+    pub fn get_reference_assets_for_project(&self, project_id: i64) -> Result<Vec<MediaAssetInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, duration_ticks, fps_num, fps_den, width, height
+             FROM media_assets
+             WHERE project_id = ?1 AND project_id IS NOT NULL AND is_reference = 1
              ORDER BY id DESC"
         )?;
         

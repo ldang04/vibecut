@@ -278,22 +278,10 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
       });
 
       if (filePaths && filePaths.length > 0) {
-        // Extract folder path from first file (assuming all files are from the same directory)
-        // The backend requires folder_path field
-        let folderPath = '';
-        if (filePaths.length > 0) {
-          const firstFilePath = filePaths[0];
-          const lastSlashIndex = Math.max(firstFilePath.lastIndexOf('/'), firstFilePath.lastIndexOf('\\'));
-          if (lastSlashIndex > 0) {
-            folderPath = firstFilePath.substring(0, lastSlashIndex);
-          }
-        }
-
         // Send individual file paths to the API (same pattern as raw footage)
         console.log('Uploading reference files:', filePaths);
         const result = await importReference.execute({ 
           file_paths: filePaths,
-          folder_path: folderPath,
         });
         if (result && result.job_id) {
           console.log('Reference upload initiated, job IDs:', result.job_ids || [result.job_id]);
