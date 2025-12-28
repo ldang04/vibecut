@@ -167,6 +167,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
   // Drag state for existing clips
   const [draggedClip, setDraggedClip] = useState<{ clip: any; startX: number; startY: number; offsetX: number; originalPosition: number } | null>(null);
   const [clipDropPosition, setClipDropPosition] = useState<{ time: number; intent: 'primary' | 'layered' } | null>(null);
+  const [potentialDrag, setPotentialDrag] = useState<{ clip: any; startX: number; startY: number; offsetX: number; originalPosition: number } | null>(null);
 
   // Helper function to draw rounded rectangle
   const drawRoundedRect = useCallback((ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) => {
@@ -355,20 +356,16 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
         const clipHeight = trackHeight - 10;
         const radius = 6;
         
-        ctx.fillStyle = isSelected ? '#10b981' : '#3b82f6';
+        // Set up clipping path for rounded rectangle
+        ctx.save();
         drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
-        ctx.fill();
-
-        // Clip border - yellow if selected
-        ctx.strokeStyle = isSelected ? '#fbbf24' : '#2563eb';
-        ctx.lineWidth = isSelected ? 3 : 1;
-        drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
-        ctx.stroke();
+        ctx.clip();
         
-        // Draw thumbnails as filmstrip
+        // Draw thumbnails as filmstrip - fill entire clip area with no gaps
+        let hasThumbnails = false;
         if (width >= 80) { // Only show thumbnails if clip is wide enough
-          const thumbSpacingPx = 80; // Spacing between thumbnails
-          const numThumbs = Math.floor(width / thumbSpacingPx);
+          const thumbSpacingPx = 80; // Spacing between thumbnail samples
+          const numThumbs = Math.ceil(width / thumbSpacingPx); // Use ceil to ensure full coverage
           
           if (numThumbs > 0) {
             // Calculate source time range for this clip
@@ -376,14 +373,19 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
             const sourceEndTime = clip.out_ticks / TICKS_PER_SECOND;
             const sourceDuration = sourceEndTime - sourceStartTime;
             
-            // Sample thumbnails evenly across the clip
+            // Draw thumbnails continuously to fill entire width with no gaps
             for (let i = 0; i < numThumbs; i++) {
-              const thumbX = x + (i * thumbSpacingPx);
+              // Calculate segment boundaries - ensure no gaps
+              const segmentStart = x + (i * thumbSpacingPx);
+              const segmentEnd = i === numThumbs - 1 
+                ? x + width  // Last segment goes to end of clip
+                : x + ((i + 1) * thumbSpacingPx);  // Regular segments
+              const segmentWidth = segmentEnd - segmentStart;
               
-              // Only draw if thumbnail is visible in viewport
-              if (thumbX + thumbSpacingPx >= leftMargin && thumbX <= canvas.width) {
+              // Only draw if segment is visible in viewport
+              if (segmentEnd >= leftMargin && segmentStart <= canvas.width && segmentWidth > 0) {
                 // Calculate source time for this thumbnail
-                const sampleTime = sourceStartTime + (i / numThumbs) * sourceDuration;
+                const sampleTime = sourceStartTime + (i / Math.max(1, numThumbs - 1)) * sourceDuration;
                 const timestampSec = Math.floor(sampleTime);
                 
                 // Try to get thumbnail from cache
@@ -391,36 +393,30 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
                 const thumbnail = thumbnailCache.get(cacheKey);
                 
                 if (thumbnail && thumbnail.complete && thumbnail.naturalWidth > 0) {
-                  // Draw thumbnail
-                  const thumbWidth = thumbSpacingPx;
-                  const thumbHeight = clipHeight;
+                  hasThumbnails = true;
                   
-                  // Calculate aspect ratio to maintain
+                  // Draw thumbnail to fill the entire segment area (cover mode, no gaps)
                   const thumbAspect = thumbnail.width / thumbnail.height;
-                  const targetAspect = thumbWidth / thumbHeight;
+                  const targetAspect = segmentWidth / clipHeight;
                   
-                  let drawWidth = thumbWidth;
-                  let drawHeight = thumbHeight;
-                  let drawX = thumbX;
+                  let drawWidth = segmentWidth;
+                  let drawHeight = clipHeight;
+                  let drawX = segmentStart;
                   let drawY = clipY;
                   
+                  // Use cover mode to fill entire segment area - extend beyond boundaries to avoid gaps
                   if (thumbAspect > targetAspect) {
-                    // Thumbnail is wider - fit to height
-                    drawWidth = thumbHeight * thumbAspect;
-                    drawX = thumbX + (thumbWidth - drawWidth) / 2;
+                    // Thumbnail is wider - fit to height, extend width to cover
+                    drawWidth = clipHeight * thumbAspect;
+                    drawX = segmentStart - (drawWidth - segmentWidth) / 2;
                   } else {
-                    // Thumbnail is taller - fit to width
-                    drawHeight = thumbWidth / thumbAspect;
-                    drawY = clipY + (thumbHeight - drawHeight) / 2;
+                    // Thumbnail is taller - fit to width, extend height to cover
+                    drawHeight = segmentWidth / thumbAspect;
+                    drawY = clipY - (drawHeight - clipHeight) / 2;
                   }
                   
-                  // Clip to rounded rectangle bounds
-                  ctx.save();
-                  drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
-                  ctx.clip();
-                  
+                  // Draw the thumbnail to fill this segment completely
                   ctx.drawImage(thumbnail, drawX, drawY, drawWidth, drawHeight);
-                  ctx.restore();
                 } else {
                   // Thumbnail not loaded yet - load it asynchronously
                   loadThumbnail(clip.asset_id, timestampSec, projectId).then((img) => {
@@ -438,6 +434,20 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
             }
           }
         }
+        
+        // Only draw colored background if no thumbnails are available
+        if (!hasThumbnails) {
+          ctx.fillStyle = isSelected ? '#10b981' : '#3b82f6';
+          ctx.fillRect(x, clipY, width, clipHeight);
+        }
+        
+        ctx.restore();
+
+        // Draw border on top - yellow if selected
+        ctx.strokeStyle = isSelected ? '#fbbf24' : '#2563eb';
+        ctx.lineWidth = isSelected ? 3 : 1;
+        drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
+        ctx.stroke();
         
         // Draw trim handles if pointer tool and clip is selected or hovered
         if (activeTool === 'pointer' && (isSelected || hoveredEdge?.clipId === clipId)) {
@@ -879,41 +889,153 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       setHoverPlayheadTicks(null);
     }
 
+    // Check if potential drag should become actual drag (requires intentional movement)
+    const DRAG_THRESHOLD = 8; // pixels - minimum movement to start dragging
+    if (potentialDrag && !draggedClip) {
+      const moveDistance = Math.sqrt(
+        Math.pow(mouseX - potentialDrag.startX, 2) + 
+        Math.pow(mouseY - potentialDrag.startY, 2)
+      );
+      
+      // Only start dragging if user has moved mouse significantly
+      if (moveDistance >= DRAG_THRESHOLD) {
+        setDraggedClip(potentialDrag);
+        setPotentialDrag(null);
+      }
+    }
+    
     // Handle clip drag
     if (draggedClip && timeline && onClipReorder) {
       const leftMargin = 3 * PIXELS_PER_REM;
-      const primaryTrackY = 50;
-      const trackHeight = 60;
-      const primaryTrackBottom = primaryTrackY + trackHeight;
+      
+      // Require minimum horizontal drag distance before showing preview (10 pixels)
+      const minDragDistance = 10 / pixelsPerSecond; // Convert to seconds
+      const horizontalDelta = Math.abs(mouseX - draggedClip.startX);
+      const horizontalDeltaTime = horizontalDelta / pixelsPerSecond;
       
       // Detect intent based on vertical movement
       const verticalDelta = Math.abs(mouseY - draggedClip.startY);
-      const horizontalDelta = Math.abs(mouseX - draggedClip.startX);
       const intent: 'primary' | 'layered' = (verticalDelta > 20 && verticalDelta > horizontalDelta) ? 'layered' : 'primary';
       
       // Calculate drop time from mouse position
       let dropTime = (mouseX - leftMargin + scrollX) / pixelsPerSecond;
       dropTime = Math.max(0, dropTime);
       
-      // Clamp to valid bounds (0 to end of timeline)
-      if (intent === 'primary') {
-        // Find end of timeline
-        let timelineEnd = 0;
-        if (timeline.tracks && timeline.tracks.length > 0) {
-          const primaryTrack = timeline.tracks.find(t => (t.id || 1) === 1);
-          if (primaryTrack && primaryTrack.clips) {
-            primaryTrack.clips.forEach((clip: any) => {
-              const clipEndTime = (clip.timeline_start_ticks + (clip.out_ticks - clip.in_ticks)) / TICKS_PER_SECOND;
-              if (clipEndTime > timelineEnd) {
-                timelineEnd = clipEndTime;
+      // For primary intent, only show preview if dragged to a position that would change order
+      if (intent === 'primary' && horizontalDeltaTime >= minDragDistance) {
+        const primaryTrack = timeline.tracks?.find(t => (t.id || 1) === 1);
+        if (primaryTrack && primaryTrack.clips) {
+          const draggedClipId = draggedClip.clip.id || `${draggedClip.clip.asset_id}-${draggedClip.clip.timeline_start_ticks}`;
+          const originalStartTime = draggedClip.originalPosition / TICKS_PER_SECOND;
+          
+          // Find clips that would be affected by this drop position
+          let foundValidDropPosition = false;
+          let snapToPosition: number | null = null;
+          
+          // Check if drop position is to the left or right of another clip
+          for (const otherClip of primaryTrack.clips) {
+            const otherClipId = otherClip.id || `${otherClip.asset_id}-${otherClip.timeline_start_ticks}`;
+            if (otherClipId === draggedClipId) continue;
+            
+            const otherClipStartTime = otherClip.timeline_start_ticks / TICKS_PER_SECOND;
+            const otherClipEndTime = otherClipStartTime + (otherClip.out_ticks - otherClip.in_ticks) / TICKS_PER_SECOND;
+            
+            // Check if drop position is near the left edge of another clip (within 30% of clip width or 0.5s, whichever is smaller)
+            const otherClipWidth = otherClipEndTime - otherClipStartTime;
+            const snapThreshold = Math.min(otherClipWidth * 0.3, 0.5);
+            
+            if (Math.abs(dropTime - otherClipStartTime) < snapThreshold) {
+              // Snap to left of this clip
+              snapToPosition = otherClipStartTime;
+              foundValidDropPosition = true;
+              break;
+            }
+            
+            // Check if drop position is near the right edge of another clip
+            if (Math.abs(dropTime - otherClipEndTime) < snapThreshold) {
+              // Snap to right of this clip
+              snapToPosition = otherClipEndTime;
+              foundValidDropPosition = true;
+              break;
+            }
+            
+            // Check if drop position is between clips (in a gap)
+            if (dropTime > otherClipEndTime) {
+              // Check if there's a next clip
+              const nextClip = primaryTrack.clips.find((c: any) => {
+                const cId = c.id || `${c.asset_id}-${c.timeline_start_ticks}`;
+                return cId !== draggedClipId && cId !== otherClipId && 
+                       c.timeline_start_ticks / TICKS_PER_SECOND > otherClipEndTime;
+              });
+              
+              if (nextClip) {
+                const nextClipStartTime = nextClip.timeline_start_ticks / TICKS_PER_SECOND;
+                if (dropTime < nextClipStartTime) {
+                  // Drop position is in a gap between clips
+                  snapToPosition = otherClipEndTime;
+                  foundValidDropPosition = true;
+                  break;
+                }
+              } else {
+                // No next clip, drop at end
+                snapToPosition = otherClipEndTime;
+                foundValidDropPosition = true;
+                break;
               }
-            });
+            }
           }
+          
+          // Also check if dragging to the very beginning (before first clip)
+          if (!foundValidDropPosition && primaryTrack.clips.length > 0) {
+            const firstClip = primaryTrack.clips.reduce((first: any, clip: any) => {
+              const firstTime = first.timeline_start_ticks / TICKS_PER_SECOND;
+              const clipTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+              return clipTime < firstTime ? clip : first;
+            });
+            const firstClipStartTime = firstClip.timeline_start_ticks / TICKS_PER_SECOND;
+            
+            if (dropTime < firstClipStartTime - 0.1) {
+              // Dragging to before first clip
+              snapToPosition = 0;
+              foundValidDropPosition = true;
+            }
+          }
+          
+          // Only show preview if we found a valid drop position that would change order
+          if (foundValidDropPosition && snapToPosition !== null) {
+            // Check if this position would actually change the clip's order
+            const wouldChangeOrder = Math.abs(snapToPosition - originalStartTime) > 0.01;
+            
+            if (wouldChangeOrder) {
+              // Find end of timeline for clamping
+              let timelineEnd = 0;
+              primaryTrack.clips.forEach((clip: any) => {
+                const clipEndTime = (clip.timeline_start_ticks + (clip.out_ticks - clip.in_ticks)) / TICKS_PER_SECOND;
+                if (clipEndTime > timelineEnd) {
+                  timelineEnd = clipEndTime;
+                }
+              });
+              
+              const clampedPosition = Math.min(snapToPosition, timelineEnd);
+              setClipDropPosition({ time: clampedPosition, intent });
+            } else {
+              // Position wouldn't change order, don't show preview
+              setClipDropPosition(null);
+            }
+          } else {
+            // No valid drop position found, don't show preview
+            setClipDropPosition(null);
+          }
+        } else {
+          setClipDropPosition(null);
         }
-        dropTime = Math.min(dropTime, timelineEnd);
+      } else if (intent === 'layered') {
+        // For layered intent, use the drop time directly
+        setClipDropPosition({ time: dropTime, intent });
+      } else {
+        // Not enough drag distance or invalid intent, don't show preview
+        setClipDropPosition(null);
       }
-      
-      setClipDropPosition({ time: dropTime, intent });
       return;
     }
 
@@ -924,7 +1046,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     }
 
     // Handle edge detection for trimming (only in pointer tool mode)
-    if (activeTool === 'pointer' && timeline && !dragAsset && !draggedClip) {
+    if (activeTool === 'pointer' && timeline && !dragAsset && !draggedClip && !potentialDrag) {
       let currentY = 50;
       let foundEdge = false;
       
@@ -1053,7 +1175,8 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       }
     }
     
-    // Check for clip drag (click on clip body, not edge)
+    // Check for potential clip drag (click on clip body, not edge)
+    // Don't start dragging immediately - wait for intentional movement
     if (!hoveredEdge && onClipReorder) {
       let currentY = 50;
       for (const track of timeline.tracks || []) {
@@ -1067,9 +1190,9 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
             // Check if click is on clip body (not near edges)
             if (x >= clipX + edgeThreshold && x <= clipX + clipWidth - edgeThreshold && 
                 x >= clipX && x <= clipX + clipWidth) {
-              // Start drag
+              // Store potential drag - will only start if user moves mouse significantly
               const offsetX = x - clipX;
-              setDraggedClip({
+              setPotentialDrag({
                 clip,
                 startX: x,
                 startY: y,
@@ -1100,7 +1223,13 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
         
         setDraggedClip(null);
         setClipDropPosition(null);
+        setPotentialDrag(null);
         return;
+      }
+      
+      // Clear potential drag if mouse is released without dragging
+      if (potentialDrag) {
+        setPotentialDrag(null);
       }
       
       // Only handle if we're dragging and have a drop position
@@ -1131,7 +1260,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
         document.removeEventListener('mouseup', handleGlobalMouseUp);
       };
     }
-  }, [dragAsset, dropPosition, onClipInsert, draggedClip, clipDropPosition, onClipReorder, timeline, calculateEarliestNextTimestamp]);
+  }, [dragAsset, dropPosition, onClipInsert, draggedClip, clipDropPosition, potentialDrag, onClipReorder, timeline, calculateEarliestNextTimestamp]);
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
     // Handle clip reorder drop
@@ -1148,9 +1277,15 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       
       setDraggedClip(null);
       setClipDropPosition(null);
+      setPotentialDrag(null);
       return;
     }
     
+    // Clear potential drag if mouse is released without dragging
+    if (potentialDrag) {
+      setPotentialDrag(null);
+    }
+
     // Handle drag drop
     if (dragAsset && dropPosition && onClipInsert) {
       e.preventDefault();
