@@ -187,4 +187,46 @@ impl FFmpegWrapper {
 
         Ok(())
     }
+
+    /// Extract thumbnail frames from video at 1 second intervals
+    /// Saves thumbnails as JPEG 160x90 to the specified output directory
+    /// Returns the directory path where thumbnails were saved
+    pub async fn extract_thumbnails(
+        input_path: &Path,
+        output_dir: &Path,
+    ) -> Result<String> {
+        // Create output directory if needed
+        tokio::fs::create_dir_all(output_dir).await?;
+
+        // Generate thumbnails at 1 fps (1 frame per second), scaled to 160x90
+        // Output format: t_0000.jpg, t_0001.jpg, etc. (timestamp in seconds)
+        let output_pattern = output_dir.join("t_%04d.jpg");
+        let output_pattern_str = output_pattern.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid output path"))?;
+
+        let status = Command::new("ffmpeg")
+            .args(&[
+                "-i",
+                input_path.to_str().unwrap(),
+                "-vf",
+                "fps=1,scale=160:90",
+                "-q:v",
+                "2", // JPEG quality (2 = high quality, 31 = low quality)
+                "-y", // Overwrite existing files
+                output_pattern_str,
+            ])
+            .output()
+            .await
+            .context("Failed to execute ffmpeg for thumbnail extraction")?
+            .status;
+
+        if !status.success() {
+            anyhow::bail!("ffmpeg failed to extract thumbnails");
+        }
+
+        // Return the directory path as a string
+        Ok(output_dir.to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid output directory path"))?
+            .to_string())
+    }
 }

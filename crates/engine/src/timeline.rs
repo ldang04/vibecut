@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub const TICKS_PER_SECOND: i64 = 48000;
 
@@ -30,12 +31,18 @@ pub struct MediaAssetRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipInstance {
+    #[serde(default = "generate_clip_id")]
+    pub id: String, // UUID for unique identification
     pub asset_id: i64,
     pub in_ticks: i64,
     pub out_ticks: i64,
     pub timeline_start_ticks: i64,
     pub speed: f64,
     pub track_id: i64,
+}
+
+fn generate_clip_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

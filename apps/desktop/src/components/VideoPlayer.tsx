@@ -7,9 +7,12 @@ interface VideoPlayerProps {
   onTimeUpdate?: (currentTime: number) => void;
   onEnded?: () => void;
   onHoverTime?: (hoverTime: number | null) => void; // Callback for hover timestamp preview
+  autoPlay?: boolean;
+  isPlaying?: boolean; // External control of playback state
+  onPlayPause?: (isPlaying: boolean) => void; // Callback when play/pause is toggled
 }
 
-export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, onHoverTime }: VideoPlayerProps) {
+export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, onHoverTime, autoPlay, isPlaying: externalIsPlaying, onPlayPause }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -17,13 +20,50 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
   const [currentTime, setCurrentTime] = useState(0);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
 
+  // Track the last src and startTime to detect changes
+  const lastSrcRef = useRef<string>('');
+  const lastStartTimeRef = useRef<number | undefined>(undefined);
+  
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    // Set start time if provided
-    if (startTime !== undefined) {
+    // Check if src or startTime changed
+    const srcChanged = lastSrcRef.current !== src;
+    const startTimeChanged = lastStartTimeRef.current !== startTime;
+    
+    if (srcChanged) {
+      lastSrcRef.current = src;
+    }
+    
+    // Update video currentTime when startTime changes (playhead moved) or src changes
+    if (startTime !== undefined && (srcChanged || startTimeChanged)) {
+      lastStartTimeRef.current = startTime;
       video.currentTime = startTime;
+    }
+
+    // Sync with external playback state (Final Cut behavior - timeline controls video)
+    // Only start playback if we're not already at the correct time
+    if (externalIsPlaying !== undefined) {
+      if (externalIsPlaying && video.paused) {
+        // Ensure video is at the correct startTime before playing
+        if (startTime !== undefined && Math.abs(video.currentTime - startTime) > 0.1) {
+          video.currentTime = startTime;
+        }
+        video.play().catch(() => {
+          // Auto-play may be blocked by browser, ignore error
+        });
+      } else if (!externalIsPlaying && !video.paused) {
+        video.pause();
+      }
+    } else if (autoPlay && video.paused) {
+      // Fallback to autoPlay if externalIsPlaying not provided
+      if (startTime !== undefined && Math.abs(video.currentTime - startTime) > 0.1) {
+        video.currentTime = startTime;
+      }
+      video.play().catch(() => {
+        // Auto-play may be blocked by browser, ignore error
+      });
     }
 
     const handleTimeUpdate = () => {
@@ -34,8 +74,13 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
       }
       // Check if we've reached the end time
       if (endTime !== undefined && current >= endTime) {
+        // Clamp to endTime to prevent going past it
+        if (video.currentTime > endTime) {
+          video.currentTime = endTime;
+        }
         video.pause();
         setIsPlaying(false);
+        // Don't reset currentTime here - let onEnded handle it
         if (onEnded) {
           onEnded();
         }
@@ -60,18 +105,33 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
       video.removeEventListener('play', handlePlay);
       video.removeEventListener('pause', handlePause);
     };
-  }, [src, startTime, endTime, onTimeUpdate, onEnded]);
+  }, [src, startTime, endTime, onTimeUpdate, onEnded, autoPlay, externalIsPlaying]);
 
   const togglePlayPause = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
 
+    // If video is at or past endTime, don't restart - let onEnded handle it
+    if (endTime !== undefined && video.currentTime >= endTime) {
+      if (onEnded) {
+        onEnded();
+      }
+      return;
+    }
+
+    // Toggle playback and notify parent (Final Cut behavior - button controls timeline)
     if (video.paused) {
       video.play();
+      if (onPlayPause) {
+        onPlayPause(true);
+      }
     } else {
       video.pause();
+      if (onPlayPause) {
+        onPlayPause(false);
+      }
     }
-  }, []);
+  }, [endTime, onEnded, onPlayPause]);
 
   const seekTo = (time: number) => {
     const video = videoRef.current;
@@ -112,27 +172,8 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
     seekTo(time);
   };
 
-  // Keyboard shortcut: spacebar to toggle play/pause
-  useEffect(() => {
-    const handleKeyPress = (e: KeyboardEvent) => {
-      // Only handle spacebar if not typing in an input/textarea/select field
-      const target = e.target as HTMLElement;
-      const isInputField = target.tagName === 'INPUT' || 
-                          target.tagName === 'TEXTAREA' || 
-                          target.tagName === 'SELECT' ||
-                          target.isContentEditable;
-      
-      if (e.code === 'Space' && !isInputField) {
-        e.preventDefault();
-        togglePlayPause();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyPress);
-    return () => {
-      window.removeEventListener('keydown', handleKeyPress);
-    };
-  }, [togglePlayPause]);
+  // Note: Spacebar handling is now in Editor.tsx to control timeline playback
+  // This component no longer handles spacebar to avoid conflicts
 
   // Expose seekTo via ref if needed
   useEffect(() => {

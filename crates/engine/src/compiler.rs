@@ -1,4 +1,5 @@
 use crate::timeline::*;
+use uuid::Uuid;
 
 // EditPlan structure (simplified - full definition would match edit_plan.json schema)
 pub struct EditPlan {
@@ -77,6 +78,7 @@ pub fn compile_edit_plan(plan: EditPlan, settings: ProjectSettings) -> Timeline 
                     let track = tracks.iter_mut().find(|t| t.id == track_id);
                     if let Some(track) = track {
                         track.clips.push(ClipInstance {
+                            id: Uuid::new_v4().to_string(),
                             asset_id,
                             in_ticks,
                             out_ticks,

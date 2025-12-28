@@ -30,6 +30,7 @@
             "items": {
               "type": "object",
               "properties": {
+                "id": { "type": "string" },
                 "asset_id": { "type": "integer" },
                 "in_ticks": { "type": "integer" },
                 "out_ticks": { "type": "integer" },

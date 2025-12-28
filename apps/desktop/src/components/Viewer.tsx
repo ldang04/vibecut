@@ -7,9 +7,12 @@ interface ViewerProps {
   endTime?: number; // in seconds
   currentTime?: number; // in seconds
   onTimeUpdate?: (time: number) => void;
+  onEnded?: () => void;
+  isPlaying?: boolean;
+  onPlayPause?: (isPlaying: boolean) => void;
 }
 
-export function Viewer({ videoSrc, startTime, endTime, currentTime, onTimeUpdate }: ViewerProps) {
+export function Viewer({ videoSrc, startTime, endTime, currentTime, onTimeUpdate, onEnded, isPlaying, onPlayPause }: ViewerProps) {
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const formatTimecode = (seconds: number): string => {
     const mins = Math.floor(seconds / 60);
@@ -37,7 +40,11 @@ export function Viewer({ videoSrc, startTime, endTime, currentTime, onTimeUpdate
             startTime={startTime}
             endTime={endTime}
             onTimeUpdate={onTimeUpdate}
+            onEnded={onEnded}
             onHoverTime={setHoverTime}
+            autoPlay={isPlaying}
+            isPlaying={isPlaying}
+            onPlayPause={onPlayPause}
           />
           {(currentTime !== undefined || hoverTime !== null) && (
             <div

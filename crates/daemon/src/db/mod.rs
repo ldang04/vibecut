@@ -111,6 +111,19 @@ impl Database {
             );
         }
 
+        // Migration: Add thumbnail_dir column if it doesn't exist
+        let has_thumbnail_dir = conn
+            .prepare("SELECT thumbnail_dir FROM media_assets LIMIT 1")
+            .is_ok();
+        
+        if !has_thumbnail_dir {
+            // Add thumbnail_dir column (nullable, stores path to thumbnail directory)
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN thumbnail_dir TEXT",
+                [],
+            );
+        }
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proxies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -595,6 +608,31 @@ impl Database {
         
         match rows.next() {
             Some(Ok(path)) => Ok(Some(path)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Set thumbnail directory path for a media asset
+    pub fn set_thumbnail_dir(&self, media_asset_id: i64, thumbnail_dir: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE media_assets SET thumbnail_dir = ?1 WHERE id = ?2",
+            params![thumbnail_dir, media_asset_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get thumbnail directory path for a media asset
+    pub fn get_thumbnail_dir(&self, media_asset_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT thumbnail_dir FROM media_assets WHERE id = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![media_asset_id], |row| {
+            Ok(row.get::<_, Option<String>>(0)?)
+        })?;
+        
+        match rows.next() {
+            Some(Ok(dir)) => Ok(dir),
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
         }

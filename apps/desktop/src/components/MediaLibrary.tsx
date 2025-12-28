@@ -27,6 +27,9 @@ interface MediaLibraryProps {
   onImportComplete?: () => void;
   onJobUpdate?: (job: JobResponse) => void;
   projectId?: number;
+  onDragStart?: (asset: MediaAsset, event: React.MouseEvent) => void;
+  onDragEnd?: () => void;
+  externalDragAsset?: MediaAsset | null; // Added: external drag state from parent
 }
 
 // Helper to safely access electron API
@@ -175,7 +178,7 @@ function ThumbnailVideo({ assetId, projectId, duration, formatDuration }: { asse
   );
 }
 
-export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate, projectId = 1 }: MediaLibraryProps) {
+export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate, projectId = 1, onDragStart, onDragEnd, externalDragAsset }: MediaLibraryProps) {
   const [referenceAssets, setReferenceAssets] = useState<MediaAsset[]>([]); // Store reference assets separately
   const [referenceJobs, setReferenceJobs] = useState<Map<number, JobResponse>>(new Map());
   const [currentJobId, setCurrentJobId] = useState<number | null>(null);
@@ -189,6 +192,9 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
   const mediaAssetsData = useDaemon<MediaAsset[]>(`/projects/${projectId}/media`, { method: 'GET' });
   const referenceAssetsData = useDaemon<MediaAsset[]>(`/projects/${projectId}/references`, { method: 'GET' });
   const [hoveredAssetId, setHoveredAssetId] = useState<number | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragAsset, setDragAsset] = useState<MediaAsset | null>(null);
+  const [dragPosition, setDragPosition] = useState<{ x: number; y: number } | null>(null);
   const jobStatus = useDaemon<JobResponse>(
     currentJobId ? `/jobs/${currentJobId}` : '',
     { method: 'GET' }
@@ -666,6 +672,61 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
 
   const handleImport = mode === 'raw' ? handleImportRaw : handleSelectReferenceFiles;
 
+  // Clear drag state when external drag asset is cleared (drop happened)
+  // Use a small delay to ensure the drop is processed first
+  useEffect(() => {
+    if (!externalDragAsset && (isDragging || dragAsset)) {
+      // External drag was cleared, so clear our local drag state
+      // Use setTimeout to ensure drop is processed first
+      const timeoutId = setTimeout(() => {
+        setIsDragging(false);
+        setDragAsset(null);
+        setDragPosition(null);
+        // Reset cursor
+        document.body.style.cursor = '';
+      }, 50); // Small delay to allow drop to process
+      
+      return () => clearTimeout(timeoutId);
+    }
+  }, [externalDragAsset, isDragging, dragAsset]);
+
+  // Handle global mouse events for drag
+  useEffect(() => {
+    const handleMouseUp = () => {
+      if (isDragging) {
+        // Clear immediately - Timeline's mouseup handler will process the drop first
+        // Use a small delay to ensure Timeline processes the drop
+        setTimeout(() => {
+          setIsDragging(false);
+          setDragAsset(null);
+          setDragPosition(null);
+          if (onDragEnd) {
+            onDragEnd();
+          }
+        }, 0);
+      }
+    };
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (isDragging) {
+        // Update cursor style globally while dragging
+        document.body.style.cursor = 'grabbing';
+        // Update drag position for preview
+        setDragPosition({ x: e.clientX, y: e.clientY });
+      }
+    };
+
+    if (isDragging) {
+      document.addEventListener('mouseup', handleMouseUp);
+      document.addEventListener('mousemove', handleMouseMove);
+      return () => {
+        document.removeEventListener('mouseup', handleMouseUp);
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.body.style.cursor = '';
+      };
+    }
+  }, [isDragging, onDragEnd]);
+
   return (
     <div
       style={{
@@ -740,7 +801,21 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
                 {displayAssets.map((asset) => (
                   <div
                     key={asset.id}
-                    onClick={() => onClipSelect(asset)}
+                    onClick={() => {
+                      if (!isDragging) {
+                        onClipSelect(asset);
+                      }
+                    }}
+                    onMouseDown={(e) => {
+                      if (e.button === 0) { // Left mouse button
+                        e.preventDefault(); // Prevent text selection
+                        setIsDragging(true);
+                        setDragAsset(asset);
+                        if (onDragStart) {
+                          onDragStart(asset, e);
+                        }
+                      }
+                    }}
                     onMouseEnter={() => setHoveredAssetId(asset.id)}
                     onMouseLeave={() => setHoveredAssetId(null)}
                     style={{
@@ -748,10 +823,11 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
                       overflow: 'hidden',
                       backgroundColor: '#1e1e1e',
                       border: '1px solid #404040',
-                      cursor: 'pointer',
+                      cursor: isDragging && dragAsset?.id === asset.id ? 'grabbing' : 'grab',
                       transition: 'border-color 0.2s',
                       outline: 'none',
                       position: 'relative',
+                      userSelect: 'none',
                     }}
                   >
                     {/* Delete button - appears on hover */}
@@ -824,7 +900,21 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
                 {displayReferenceAssets.map((asset) => (
                   <div
                     key={asset.id}
-                    onClick={() => onClipSelect(asset)}
+                    onClick={() => {
+                      if (!isDragging) {
+                        onClipSelect(asset);
+                      }
+                    }}
+                    onMouseDown={(e) => {
+                      if (e.button === 0) { // Left mouse button
+                        e.preventDefault(); // Prevent text selection
+                        setIsDragging(true);
+                        setDragAsset(asset);
+                        if (onDragStart) {
+                          onDragStart(asset, e);
+                        }
+                      }
+                    }}
                     onMouseEnter={() => setHoveredAssetId(asset.id)}
                     onMouseLeave={() => setHoveredAssetId(null)}
                     style={{
@@ -832,10 +922,11 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
                       overflow: 'hidden',
                       backgroundColor: '#1e1e1e',
                       border: '1px solid #404040',
-                      cursor: 'pointer',
+                      cursor: isDragging && dragAsset?.id === asset.id ? 'grabbing' : 'grab',
                       transition: 'border-color 0.2s',
                       outline: 'none',
                       position: 'relative',
+                      userSelect: 'none',
                     }}
                   >
                     {/* Delete button - appears on hover */}
@@ -907,6 +998,53 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
           </div>
         )}
       </div>
+
+      {/* Drag Preview - follows cursor */}
+      {isDragging && dragAsset && dragPosition && (
+        <div
+          style={{
+            position: 'fixed',
+            left: dragPosition.x - 80,
+            top: dragPosition.y - 60,
+            width: '160px',
+            height: '90px',
+            backgroundColor: '#1e1e1e',
+            border: '2px solid #3b82f6',
+            borderRadius: '8px',
+            pointerEvents: 'none',
+            zIndex: 10000,
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
+            opacity: 0.9,
+            transform: 'scale(0.8)',
+          }}
+        >
+          <div
+            style={{
+              width: '100%',
+              height: '100%',
+              borderRadius: '6px',
+              overflow: 'hidden',
+              backgroundColor: '#2a2a2a',
+            }}
+          >
+            <video
+              src={`http://127.0.0.1:7777/api/projects/${projectId}/media/${dragAsset.id}/proxy`}
+              style={{
+                width: '100%',
+                height: '100%',
+                objectFit: 'cover',
+              }}
+              muted
+              playsInline
+              preload="metadata"
+              onLoadedMetadata={(e) => {
+                const video = e.target as HTMLVideoElement;
+                video.currentTime = 0.1;
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

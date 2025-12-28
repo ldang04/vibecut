@@ -58,6 +58,8 @@ pub fn router(db: Arc<Database>, job_manager: Arc<JobManager>) -> Router {
         .route("/:id/references", get(list_references))
         .route("/:id/media/:asset_id", delete(delete_media_asset))
         .route("/:id/media/:asset_id/proxy", get(get_proxy_file))
+        .route("/:id/media/:asset_id/thumbnail/:timestamp_ms", get(get_thumbnail))
+        .route("/:id/media/:asset_id/generate_thumbnails", post(generate_thumbnails_for_asset))
         .route("/proxy/:asset_id", get(get_proxy_file_legacy)) // Legacy route for compatibility
         .with_state((db, job_manager))
 }
@@ -254,6 +256,90 @@ async fn serve_video_file(
     Ok(response_builder
         .body(body)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+}
+
+/// Get thumbnail image for a specific timestamp
+async fn get_thumbnail(
+    State((db, _job_manager)): State<(Arc<Database>, Arc<JobManager>)>,
+    Path((project_id, asset_id, timestamp_ms)): Path<(i64, i64, String)>,
+) -> Result<Response, StatusCode> {
+    // Get thumbnail directory for this asset
+    let thumbnail_dir = db.get_thumbnail_dir(asset_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    
+    // Parse timestamp (format: "0000" for 0 seconds, "0100" for 1 second, etc.)
+    // The timestamp_ms is actually the second number (e.g., "0000" = 0s, "0100" = 1s)
+    let timestamp_sec: u64 = timestamp_ms.parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    
+    // Construct thumbnail file path: {thumbnail_dir}/t_{timestamp_sec:04d}.jpg
+    let thumbnail_filename = format!("t_{:04}.jpg", timestamp_sec);
+    let thumbnail_path = PathBuf::from(&thumbnail_dir).join(&thumbnail_filename);
+    
+    if !thumbnail_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    
+    // Read thumbnail file
+    let thumbnail_data = tokio::fs::read(&thumbnail_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    
+    // Get file metadata
+    let metadata = tokio::fs::metadata(&thumbnail_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let file_size = metadata.len();
+    
+    // Build response with image/jpeg content type
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CONTENT_LENGTH, file_size.to_string())
+        .header(header::CACHE_CONTROL, "public, max-age=31536000") // Cache for 1 year
+        .body(Body::from(thumbnail_data))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(response)
+}
+
+/// Generate thumbnails for an asset that doesn't have them yet
+async fn generate_thumbnails_for_asset(
+    State((db, _job_manager)): State<(Arc<Database>, Arc<JobManager>)>,
+    Path((project_id, asset_id)): Path<(i64, i64)>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use std::path::Path;
+    
+    // Get asset path
+    let asset_path = db.get_media_asset_path(asset_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    
+    // Check if thumbnails already exist
+    if let Ok(Some(_)) = db.get_thumbnail_dir(asset_id) {
+        // Thumbnails already exist
+        return Ok(Json(json!({ "status": "already_exists" })));
+    }
+    
+    // Generate thumbnails
+    let cache_dir = PathBuf::from(".cache");
+    let thumbnails_dir = cache_dir.join("thumbs").join(format!("asset_{}", asset_id));
+    
+    let thumbnail_dir_path = FFmpegWrapper::extract_thumbnails(
+        Path::new(&asset_path),
+        &thumbnails_dir,
+    ).await
+    .map_err(|e| {
+        eprintln!("Failed to extract thumbnails: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    
+    // Store thumbnail directory in database
+    db.set_thumbnail_dir(asset_id, &thumbnail_dir_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(json!({ "status": "success", "thumbnail_dir": thumbnail_dir_path })))
 }
 
 /// Parse Range header value (e.g., "bytes=0-1023")
@@ -577,5 +663,84 @@ async fn process_import(
     }
 
     job_manager.update_job_status(job_id, crate::jobs::JobStatus::Completed, Some(1.0))?;
+    Ok(())
+}
+
+/// Process proxy generation job with thumbnail extraction
+/// This function generates a proxy video and extracts thumbnails for a media asset
+pub async fn process_proxy_generation_with_thumbnails(
+    db: Arc<Database>,
+    job_manager: Arc<JobManager>,
+    job_id: i64,
+    media_asset_id: i64,
+    input_path: &str,
+) -> anyhow::Result<()> {
+    use std::path::Path;
+    
+    // Get media asset info to determine proxy dimensions
+    let asset_path = db.get_media_asset_path(media_asset_id)?
+        .ok_or_else(|| anyhow::anyhow!("Media asset not found"))?;
+    
+    // Probe to get dimensions
+    let media_info = FFmpegWrapper::probe(Path::new(&asset_path)).await?;
+    
+    // Calculate proxy dimensions (scale down if large)
+    let proxy_width = if media_info.width > 1920 { 1920 } else { media_info.width };
+    let proxy_height = if media_info.height > 1080 { 1080 } else { media_info.height };
+    
+    // Determine proxy output path
+    let cache_dir = PathBuf::from(".cache");
+    let proxies_dir = cache_dir.join("proxies");
+    tokio::fs::create_dir_all(&proxies_dir).await?;
+    
+    let proxy_filename = format!("proxy_{}.mp4", media_asset_id);
+    let proxy_path = proxies_dir.join(&proxy_filename);
+    
+    // Generate proxy
+    job_manager.update_job_status(
+        job_id,
+        crate::jobs::JobStatus::Running,
+        Some(0.3),
+    )?;
+    
+    FFmpegWrapper::generate_proxy(
+        Path::new(input_path),
+        &proxy_path,
+        proxy_width,
+        proxy_height,
+    ).await?;
+    
+    // Store proxy path in database
+    db.create_proxy(
+        media_asset_id,
+        proxy_path.to_str().unwrap(),
+        "libx264",
+        proxy_width,
+        proxy_height,
+    )?;
+    
+    // Generate thumbnails
+    job_manager.update_job_status(
+        job_id,
+        crate::jobs::JobStatus::Running,
+        Some(0.7),
+    )?;
+    
+    let thumbnails_dir = cache_dir.join("thumbs").join(format!("asset_{}", media_asset_id));
+    let thumbnail_dir_path = FFmpegWrapper::extract_thumbnails(
+        Path::new(input_path),
+        &thumbnails_dir,
+    ).await?;
+    
+    // Store thumbnail directory in database
+    db.set_thumbnail_dir(media_asset_id, &thumbnail_dir_path)?;
+    
+    // Mark job as completed
+    job_manager.update_job_status(
+        job_id,
+        crate::jobs::JobStatus::Completed,
+        Some(1.0),
+    )?;
+    
     Ok(())
 }
