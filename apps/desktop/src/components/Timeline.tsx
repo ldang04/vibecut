@@ -25,6 +25,7 @@ interface TimelineProps {
   onClipTrim?: (clipId: string, newInTicks: number, newOutTicks: number) => void;
   onClipSplit?: (clipId: string, positionTicks: number) => void;
   onPlayheadSet?: (positionTicks: number) => void;
+  onClipReorder?: (clipId: string, newPositionTicks: number) => void;
   activeTool?: 'pointer' | 'cut';
   projectId?: number; // Project ID for thumbnail API calls
   isPlaying?: boolean; // Whether timeline is currently playing (for auto-scroll)
@@ -152,7 +153,7 @@ async function loadThumbnail(assetId: number, timestampSec: number, projectId: n
   return loadPromise;
 }
 
-export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition = 0, dragAsset, onClipInsert, onHoverTimeChange, onClipTrim, onClipSplit, onPlayheadSet, activeTool = 'pointer', projectId = 1, isPlaying = false }: TimelineProps) {
+export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition = 0, dragAsset, onClipInsert, onHoverTimeChange, onClipTrim, onClipSplit, onPlayheadSet, onClipReorder, activeTool = 'pointer', projectId = 1, isPlaying = false }: TimelineProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [pixelsPerSecond, setPixelsPerSecond] = useState(20); // Initial zoom level
   const [scrollX, setScrollX] = useState(0); // Horizontal scroll offset in pixels
@@ -162,6 +163,10 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
   const [trimState, setTrimState] = useState<{ clipId: string; edge: 'left' | 'right'; startX: number; originalIn: number; originalOut: number; originalStart: number } | null>(null);
   const [hoveredEdge, setHoveredEdge] = useState<{ clipId: string; edge: 'left' | 'right' } | null>(null);
   const [loadedThumbnails, setLoadedThumbnails] = useState<Map<string, HTMLImageElement>>(new Map());
+  
+  // Drag state for existing clips
+  const [draggedClip, setDraggedClip] = useState<{ clip: any; startX: number; startY: number; offsetX: number; originalPosition: number } | null>(null);
+  const [clipDropPosition, setClipDropPosition] = useState<{ time: number; intent: 'primary' | 'layered' } | null>(null);
 
   // Helper function to draw rounded rectangle
   const drawRoundedRect = useCallback((ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) => {
@@ -310,6 +315,14 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       // Draw clips
       track.clips?.forEach((clip: any) => {
         const clipId = clip.id || `${clip.asset_id}-${clip.timeline_start_ticks}`;
+        
+        // Skip drawing if this clip is being dragged
+        if (draggedClip && (draggedClip.clip.id === clipId || 
+            (draggedClip.clip.asset_id === clip.asset_id && 
+             draggedClip.clip.timeline_start_ticks === clip.timeline_start_ticks))) {
+          return;
+        }
+        
         const isSelected = selectedClip && 
           (selectedClip.id === clipId || 
            (selectedClip.id === clip.id) ||
@@ -546,6 +559,115 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       }
     }
 
+    // Draw clip drag feedback
+    if (draggedClip && clipDropPosition && timeline) {
+      const clip = draggedClip.clip;
+      const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+      const dropTime = clipDropPosition.time;
+      const dropX = leftMargin + (dropTime * pixelsPerSecond) - scrollX;
+      const trackHeight = 60;
+      const trackSpacing = 10;
+      const primaryTrackY = 50;
+      const previewY = primaryTrackY + 5;
+      const previewHeight = trackHeight - 10;
+      const radius = 6;
+      const previewWidth = clipDuration * pixelsPerSecond;
+      
+      if (dropX >= leftMargin && dropX <= canvas.width) {
+        if (clipDropPosition.intent === 'primary') {
+          // Primary reorder - show insertion indicator and ripple preview
+          // Draw insertion indicator (vertical line)
+          ctx.strokeStyle = '#10b981';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 5]);
+          ctx.beginPath();
+          ctx.moveTo(dropX, 30);
+          ctx.lineTo(dropX, Math.max(y, primaryTrackY + trackHeight));
+          ctx.stroke();
+          ctx.setLineDash([]);
+          
+          // Draw ghost preview of dragged clip
+          ctx.strokeStyle = '#10b981';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([8, 4]);
+          drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          
+          ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
+          drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
+          ctx.fill();
+          
+          // Show ripple preview - preview shifted clips
+          const primaryTrack = timeline.tracks?.find(t => (t.id || 1) === 1);
+          if (primaryTrack) {
+            primaryTrack.clips?.forEach((otherClip: any) => {
+              const otherClipId = otherClip.id || `${otherClip.asset_id}-${otherClip.timeline_start_ticks}`;
+              // Skip the dragged clip
+              if (draggedClip.clip.id === otherClipId || 
+                  (draggedClip.clip.asset_id === otherClip.asset_id && 
+                   draggedClip.clip.timeline_start_ticks === otherClip.timeline_start_ticks)) {
+                return;
+              }
+              
+              const otherClipStartTime = otherClip.timeline_start_ticks / TICKS_PER_SECOND;
+              const otherClipDuration = (otherClip.out_ticks - otherClip.in_ticks) / TICKS_PER_SECOND;
+              
+              // Calculate if this clip will be shifted
+              const originalStart = draggedClip.originalPosition / TICKS_PER_SECOND;
+              let shiftedStartTime = otherClipStartTime;
+              
+              // If clip is after original position, it shifts left
+              if (otherClipStartTime > originalStart) {
+                shiftedStartTime = otherClipStartTime - clipDuration;
+              }
+              
+              // If clip is at/after drop position, it shifts right
+              if (otherClipStartTime >= dropTime) {
+                shiftedStartTime = otherClipStartTime + clipDuration;
+              }
+              
+              // Only show preview if position changed
+              if (Math.abs(shiftedStartTime - otherClipStartTime) > 0.01) {
+                const shiftedX = leftMargin + (shiftedStartTime * pixelsPerSecond) - scrollX;
+                const otherClipWidth = otherClipDuration * pixelsPerSecond;
+                
+                if (shiftedX + otherClipWidth >= leftMargin && shiftedX <= canvas.width) {
+                  ctx.strokeStyle = 'rgba(16, 185, 129, 0.5)';
+                  ctx.lineWidth = 1;
+                  ctx.setLineDash([4, 4]);
+                  drawRoundedRect(ctx, shiftedX, previewY, otherClipWidth, previewHeight, radius);
+                  ctx.stroke();
+                  ctx.setLineDash([]);
+                }
+              }
+            });
+          }
+        } else {
+          // Layered overlay - show different visual feedback
+          ctx.strokeStyle = '#3b82f6';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 5]);
+          ctx.beginPath();
+          ctx.moveTo(dropX, 30);
+          ctx.lineTo(dropX, Math.max(y, primaryTrackY + trackHeight));
+          ctx.stroke();
+          ctx.setLineDash([]);
+          
+          ctx.strokeStyle = '#3b82f6';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([8, 4]);
+          drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          
+          ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+          drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
+          ctx.fill();
+        }
+      }
+    }
+
             // Draw hover playhead (yellow) - follows mouse
             if (hoverPlayheadTicks !== null) {
               const hoverPlayheadTime = hoverPlayheadTicks / TICKS_PER_SECOND;
@@ -573,7 +695,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
                 ctx.stroke();
               }
             }
-  }, [timeline, selectedClip, playheadPosition, hoverPlayheadTicks, pixelsPerSecond, scrollX, dragAsset, dropPosition, trimState, hoveredEdge, activeTool, hoverX, calculateEarliestNextTimestamp, drawRoundedRect, loadedThumbnails, projectId]);
+  }, [timeline, selectedClip, playheadPosition, hoverPlayheadTicks, pixelsPerSecond, scrollX, dragAsset, dropPosition, trimState, hoveredEdge, activeTool, hoverX, calculateEarliestNextTimestamp, drawRoundedRect, loadedThumbnails, projectId, draggedClip, clipDropPosition]);
 
   // Auto-scroll during playback to keep playhead visible (Final Cut behavior)
   useEffect(() => {
@@ -757,6 +879,44 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       setHoverPlayheadTicks(null);
     }
 
+    // Handle clip drag
+    if (draggedClip && timeline && onClipReorder) {
+      const leftMargin = 3 * PIXELS_PER_REM;
+      const primaryTrackY = 50;
+      const trackHeight = 60;
+      const primaryTrackBottom = primaryTrackY + trackHeight;
+      
+      // Detect intent based on vertical movement
+      const verticalDelta = Math.abs(mouseY - draggedClip.startY);
+      const horizontalDelta = Math.abs(mouseX - draggedClip.startX);
+      const intent: 'primary' | 'layered' = (verticalDelta > 20 && verticalDelta > horizontalDelta) ? 'layered' : 'primary';
+      
+      // Calculate drop time from mouse position
+      let dropTime = (mouseX - leftMargin + scrollX) / pixelsPerSecond;
+      dropTime = Math.max(0, dropTime);
+      
+      // Clamp to valid bounds (0 to end of timeline)
+      if (intent === 'primary') {
+        // Find end of timeline
+        let timelineEnd = 0;
+        if (timeline.tracks && timeline.tracks.length > 0) {
+          const primaryTrack = timeline.tracks.find(t => (t.id || 1) === 1);
+          if (primaryTrack && primaryTrack.clips) {
+            primaryTrack.clips.forEach((clip: any) => {
+              const clipEndTime = (clip.timeline_start_ticks + (clip.out_ticks - clip.in_ticks)) / TICKS_PER_SECOND;
+              if (clipEndTime > timelineEnd) {
+                timelineEnd = clipEndTime;
+              }
+            });
+          }
+        }
+        dropTime = Math.min(dropTime, timelineEnd);
+      }
+      
+      setClipDropPosition({ time: dropTime, intent });
+      return;
+    }
+
     // Handle trim drag
     if (trimState) {
       // Trim is in progress, just update hoverX for visual feedback
@@ -764,7 +924,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     }
 
     // Handle edge detection for trimming (only in pointer tool mode)
-    if (activeTool === 'pointer' && timeline && !dragAsset) {
+    if (activeTool === 'pointer' && timeline && !dragAsset && !draggedClip) {
       let currentY = 50;
       let foundEdge = false;
       
@@ -858,14 +1018,23 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     setHoverX(null);
     setHoverPlayheadTicks(null);
     setDropPosition(null);
+    // Don't clear draggedClip on mouse leave - allow drag to continue
   };
 
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (activeTool === 'pointer' && hoveredEdge && timeline && onClipTrim) {
-      // Start trim operation
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      
+    if (!canvasRef.current || !timeline || activeTool !== 'pointer') return;
+    
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const leftMargin = 3 * PIXELS_PER_REM;
+    const trackHeight = 60;
+    const trackSpacing = 10;
+    const edgeThreshold = 5; // pixels
+    
+    // Check for trim operation first (edge hover)
+    if (hoveredEdge && onClipTrim) {
       for (const track of timeline.tracks || []) {
         for (const clip of track.clips || []) {
           const clipId = clip.id || `${clip.asset_id}-${clip.timeline_start_ticks}`;
@@ -873,7 +1042,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
             setTrimState({
               clipId,
               edge: hoveredEdge.edge,
-              startX: e.clientX - canvas.getBoundingClientRect().left,
+              startX: x,
               originalIn: clip.in_ticks,
               originalOut: clip.out_ticks,
               originalStart: clip.timeline_start_ticks,
@@ -883,11 +1052,57 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
         }
       }
     }
+    
+    // Check for clip drag (click on clip body, not edge)
+    if (!hoveredEdge && onClipReorder) {
+      let currentY = 50;
+      for (const track of timeline.tracks || []) {
+        if (y >= currentY && y <= currentY + trackHeight) {
+          for (const clip of track.clips || []) {
+            const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+            const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+            const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+            const clipWidth = clipDuration * pixelsPerSecond;
+            
+            // Check if click is on clip body (not near edges)
+            if (x >= clipX + edgeThreshold && x <= clipX + clipWidth - edgeThreshold && 
+                x >= clipX && x <= clipX + clipWidth) {
+              // Start drag
+              const offsetX = x - clipX;
+              setDraggedClip({
+                clip,
+                startX: x,
+                startY: y,
+                offsetX,
+                originalPosition: clip.timeline_start_ticks,
+              });
+              return;
+            }
+          }
+        }
+        currentY += trackHeight + trackSpacing;
+      }
+    }
   };
 
   // Global mouseup handler for drag drop (handles case where mouse leaves canvas)
   useEffect(() => {
     const handleGlobalMouseUp = (e: MouseEvent) => {
+      // Handle clip reorder drop
+      if (draggedClip && clipDropPosition && onClipReorder) {
+        const clipId = draggedClip.clip.id || `${draggedClip.clip.asset_id}-${draggedClip.clip.timeline_start_ticks}`;
+        const positionTicks = Math.round(clipDropPosition.time * TICKS_PER_SECOND);
+        
+        // Only reorder if position changed and intent is primary
+        if (clipDropPosition.intent === 'primary' && positionTicks !== draggedClip.originalPosition) {
+          onClipReorder(clipId, positionTicks);
+        }
+        
+        setDraggedClip(null);
+        setClipDropPosition(null);
+        return;
+      }
+      
       // Only handle if we're dragging and have a drop position
       if (dragAsset && dropPosition && onClipInsert) {
         // Check if mouse is over the canvas
@@ -910,15 +1125,32 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       }
     };
 
-    if (dragAsset) {
+    if (dragAsset || draggedClip) {
       document.addEventListener('mouseup', handleGlobalMouseUp);
       return () => {
         document.removeEventListener('mouseup', handleGlobalMouseUp);
       };
     }
-  }, [dragAsset, dropPosition, onClipInsert, timeline, calculateEarliestNextTimestamp]);
+  }, [dragAsset, dropPosition, onClipInsert, draggedClip, clipDropPosition, onClipReorder, timeline, calculateEarliestNextTimestamp]);
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    // Handle clip reorder drop
+    if (draggedClip && clipDropPosition && onClipReorder) {
+      e.preventDefault();
+      e.stopPropagation();
+      const clipId = draggedClip.clip.id || `${draggedClip.clip.asset_id}-${draggedClip.clip.timeline_start_ticks}`;
+      const positionTicks = Math.round(clipDropPosition.time * TICKS_PER_SECOND);
+      
+      // Only reorder if position changed and intent is primary
+      if (clipDropPosition.intent === 'primary' && positionTicks !== draggedClip.originalPosition) {
+        onClipReorder(clipId, positionTicks);
+      }
+      
+      setDraggedClip(null);
+      setClipDropPosition(null);
+      return;
+    }
+    
     // Handle drag drop
     if (dragAsset && dropPosition && onClipInsert) {
       e.preventDefault();

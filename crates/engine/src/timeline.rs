@@ -45,7 +45,7 @@ fn generate_clip_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum TrackKind {
     Video,
     Audio,

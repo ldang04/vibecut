@@ -33,6 +33,8 @@ pub fn router(db: Arc<Database>) -> Router {
     Router::new()
         .route("/:id/timeline", get(get_timeline))
         .route("/:id/timeline/apply", post(apply_operations))
+        .route("/:id/timeline/consolidate", post(consolidate_timeline))
+        .route("/timeline/consolidate-all", post(consolidate_all_timelines))
         .route("/:id/timeline/diff", post(log_diff))
         .route("/:id/timeline/test", post(test_timeline_serialization))
         .with_state(db)
@@ -161,6 +163,10 @@ async fn apply_operations(
     }
     
     eprintln!("=== OPERATION APPLICATION COMPLETE ===");
+    
+    // Automatically consolidate timeline after operations to ensure all primary clips are on track 1
+    timeline.consolidate_timeline();
+    eprintln!("Timeline after consolidation - tracks: {}", timeline.tracks.len());
 
     // Serialize and save updated timeline
     eprintln!("Timeline after all operations - tracks: {}, captions: {}, music: {}, markers: {}", 
@@ -296,6 +302,103 @@ async fn apply_operations(
     Ok(Json(TimelineResponse {
         timeline: timeline_value,
     }))
+}
+
+async fn consolidate_timeline(
+    State(db): State<Arc<Database>>,
+    Path(project_id): Path<i64>,
+) -> Result<Json<TimelineResponse>, StatusCode> {
+    // Load timeline from database
+    let timeline_json = db
+        .get_timeline(project_id)
+        .map_err(|e| {
+            eprintln!("Failed to get timeline from database: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Deserialize timeline or create default
+    let mut timeline: Timeline = if let Some(json_str) = timeline_json {
+        match serde_json::from_str::<Timeline>(&json_str) {
+            Ok(t) => t,
+            Err(_) => {
+                // Create default timeline if deserialization fails
+                let settings = ProjectSettings {
+                    fps: 30.0,
+                    resolution: Resolution {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    sample_rate: 48000,
+                    ticks_per_second: TICKS_PER_SECOND,
+                };
+                Timeline::new(settings)
+            }
+        }
+    } else {
+        // Create default timeline if none exists
+        let settings = ProjectSettings {
+            fps: 30.0,
+            resolution: Resolution {
+                width: 1920,
+                height: 1080,
+            },
+            sample_rate: 48000,
+            ticks_per_second: TICKS_PER_SECOND,
+        };
+        Timeline::new(settings)
+    };
+    
+    // Consolidate timeline
+    timeline.consolidate_timeline();
+    
+    // Save consolidated timeline
+    let updated_timeline_json = serde_json::to_string(&timeline)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    db.store_timeline(project_id, &updated_timeline_json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let timeline_value: Value = serde_json::to_value(&timeline)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    Ok(Json(TimelineResponse { timeline: timeline_value }))
+}
+
+async fn consolidate_all_timelines(
+    State(db): State<Arc<Database>>,
+) -> Result<Json<Value>, StatusCode> {
+    // Get all projects
+    let projects = db.get_all_projects()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    let total_projects = projects.len();
+    let mut consolidated_count = 0;
+    
+    for project in projects {
+        let timeline_json = db
+            .get_timeline(project.id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        if let Some(json_str) = timeline_json {
+            if let Ok(mut timeline) = serde_json::from_str::<Timeline>(&json_str) {
+                // Consolidate timeline
+                timeline.consolidate_timeline();
+                
+                // Save consolidated timeline
+                if let Ok(updated_json) = serde_json::to_string(&timeline) {
+                    if db.store_timeline(project.id, &updated_json).is_ok() {
+                        consolidated_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(Json(json!({
+        "success": true,
+        "consolidated_count": consolidated_count,
+        "total_projects": total_projects
+    })))
 }
 
 async fn log_diff(

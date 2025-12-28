@@ -552,6 +552,31 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
     }
   };
 
+  // Handle clip reorder (magnetic timeline reordering)
+  const handleClipReorder = async (clipId: string, newPositionTicks: number) => {
+    const operation = {
+      type: 'ReorderClip',
+      clip_id: clipId,
+      new_position_ticks: newPositionTicks,
+    };
+
+    const result = await applyOperations.execute({ operations: [operation] });
+    if (result && result.timeline) {
+      setTimeline(result.timeline);
+      timelineData.execute();
+      
+      // If timeline was playing, restart from current position
+      if (isTimelinePlaying) {
+        stopTimelinePlayback();
+        setTimeout(() => {
+          startTimelinePlayback();
+        }, 200);
+      }
+    } else {
+      timelineData.execute();
+    }
+  };
+
   // Handle clear timeline
   const handleClearTimeline = async () => {
     if (!window.confirm('Are you sure you want to clear the entire timeline? This cannot be undone.')) {
@@ -584,6 +609,19 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
                           target.isContentEditable;
       
       if (isInputField) {
+        return;
+      }
+
+      // Tool shortcuts: 'a' for pointer, 'b' for cut
+      if (e.key === 'a' || e.key === 'A') {
+        e.preventDefault();
+        setActiveTool('pointer');
+        return;
+      }
+      
+      if (e.key === 'b' || e.key === 'B') {
+        e.preventDefault();
+        setActiveTool('cut');
         return;
       }
 
@@ -620,7 +658,7 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedClip, handleClearTimeline, isTimelinePlaying, startTimelinePlayback, stopTimelinePlayback]);
+  }, [selectedClip, handleClearTimeline, isTimelinePlaying, startTimelinePlayback, stopTimelinePlayback, setActiveTool]);
 
   // Handle drag start from library
   const handleDragStart = (asset: any) => {
@@ -730,6 +768,7 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
               setPlayheadPosition(ticks);
               playheadPositionRef.current = ticks; // Update ref immediately
             }}
+            onClipReorder={handleClipReorder}
             activeTool={activeTool}
             projectId={projectId}
           />
