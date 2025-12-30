@@ -15,6 +15,7 @@ interface ToolbarProps {
   isGenerating?: boolean;
   isExporting?: boolean;
   isUploading?: boolean;
+  isAnalyzing?: boolean;
   currentProjectId?: number;
   currentProjectName?: string;
   projects?: Project[];
@@ -28,6 +29,7 @@ export function Toolbar({
   isGenerating = false,
   isExporting = false,
   isUploading = false,
+  isAnalyzing = false,
   currentProjectId,
   currentProjectName = 'My First Project',
   projects = [],
@@ -66,7 +68,7 @@ export function Toolbar({
         gap: '0.5rem',
       }}
     >
-      {/* Upload progress indicator on left */}
+      {/* Upload or Analyzing progress indicator on left */}
       {isUploading && (
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
           <div
@@ -80,6 +82,21 @@ export function Toolbar({
             }}
           />
           <span style={{ fontSize: '0.875rem', color: '#e5e5e5' }}>Uploading...</span>
+        </div>
+      )}
+      {!isUploading && isAnalyzing && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <div
+            style={{
+              width: '16px',
+              height: '16px',
+              border: '2px solid #404040',
+              borderTop: '2px solid #10b981',
+              borderRadius: '50%',
+              animation: 'spin 1s linear infinite',
+            }}
+          />
+          <span style={{ fontSize: '0.875rem', color: '#e5e5e5' }}>Analyzing...</span>
         </div>
       )}
 
@@ -206,21 +223,24 @@ export function Toolbar({
 
       <div style={{ flex: 1 }} />
 
-      <button
-        onClick={onGenerate}
-        disabled={isGenerating}
-        style={{
-          backgroundColor: isGenerating ? '#505050' : '#10b981',
-          color: 'white',
-          border: 'none',
-          padding: '0.375rem 0.75rem',
-          fontSize: '0.875rem',
-          borderRadius: '4px',
-          cursor: isGenerating ? 'not-allowed' : 'pointer',
-        }}
-      >
-        {isGenerating ? 'Generating...' : 'Generate'}
-      </button>
+      {/* Conditionally render Generate button based on feature flag */}
+      {import.meta.env.VITE_VIBECUT_ORCHESTRATOR !== 'true' && !import.meta.env.DEV && (
+        <button
+          onClick={onGenerate}
+          disabled={isGenerating}
+          style={{
+            backgroundColor: isGenerating ? '#505050' : '#10b981',
+            color: 'white',
+            border: 'none',
+            padding: '0.375rem 0.75rem',
+            fontSize: '0.875rem',
+            borderRadius: '4px',
+            cursor: isGenerating ? 'not-allowed' : 'pointer',
+          }}
+        >
+          {isGenerating ? 'Generating...' : 'Generate'}
+        </button>
+      )}
 
       <button
         onClick={onExport}

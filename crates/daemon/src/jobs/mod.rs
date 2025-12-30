@@ -7,6 +7,14 @@ use std::sync::Arc;
 
 use crate::db::Database;
 
+pub mod processor;
+pub mod build_segments;
+pub mod transcribe;
+pub mod vision;
+pub mod enrichment;
+pub mod metadata;
+pub mod embeddings;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobType {
     ImportRaw,
@@ -15,6 +23,13 @@ pub enum JobType {
     AnalyzeVision,
     GenerateEdit,
     Export,
+    BuildSegments,
+    TranscribeAsset,
+    AnalyzeVisionAsset,
+    EnrichSegmentsFromTranscript,
+    EnrichSegmentsFromVision,
+    ComputeSegmentMetadata,
+    EmbedSegments,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

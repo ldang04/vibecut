@@ -14,18 +14,43 @@ interface MediaAsset {
   height: number;
 }
 
+interface TextTemplate {
+  id: string;
+  name: 'Title' | 'Subtitle';
+  defaultText: string;
+  style: {
+    fontSize: number;
+    alignment: 'center' | 'bottom';
+    position: 'center' | 'bottom';
+  };
+}
+
+interface AudioAsset {
+  id: number;
+  path: string;
+  duration_ticks: number;
+}
+
 interface TimelineProps {
   timeline: TimelineData | null;
   selectedClip: any | null;
-  onClipClick: (clip: any) => void;
+  onClipClick: (clip: any, event?: React.MouseEvent) => void;
   playheadPosition?: number; // in ticks
   dragAsset?: MediaAsset | null;
+  dragTextTemplate?: TextTemplate | null;
+  dragAudioAsset?: AudioAsset | null;
   onClipInsert?: (assetId: number, positionTicks: number, trackId: number, intent?: 'primary' | 'layered', modifierKey?: boolean) => void;
+  onTextClipInsert?: (template: TextTemplate, positionTicks: number, intent?: 'primary' | 'layered', trackId?: number) => void;
+  onAudioClipInsert?: (audioAsset: AudioAsset, positionTicks: number) => void;
+  onDragEnd?: () => void; // Callback to clear drag state in parent
   onHoverTimeChange?: (time: number) => void;
   onClipTrim?: (clipId: string, newInTicks: number, newOutTicks: number) => void;
   onClipSplit?: (clipId: string, positionTicks: number) => void;
   onPlayheadSet?: (positionTicks: number) => void;
   onClipReorder?: (clipId: string, newPositionTicks: number) => void;
+  onConvertPrimaryToOverlay?: (clipId: string, positionTicks: number) => void;
+  onConvertOverlayToPrimary?: (clipId: string, positionTicks: number) => void;
+  onMoveClip?: (clipId: string, newPositionTicks: number) => void;
   activeTool?: 'pointer' | 'cut';
   projectId?: number; // Project ID for thumbnail API calls
   isPlaying?: boolean; // Whether timeline is currently playing (for auto-scroll)
@@ -153,14 +178,14 @@ async function loadThumbnail(assetId: number, timestampSec: number, projectId: n
   return loadPromise;
 }
 
-export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition = 0, dragAsset, onClipInsert, onHoverTimeChange, onClipTrim, onClipSplit, onPlayheadSet, onClipReorder, activeTool = 'pointer', projectId = 1, isPlaying = false }: TimelineProps) {
+export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition = 0, dragAsset, dragTextTemplate, dragAudioAsset, onClipInsert, onTextClipInsert, onAudioClipInsert, onDragEnd, onHoverTimeChange, onClipTrim, onClipSplit, onPlayheadSet, onClipReorder, onConvertPrimaryToOverlay, onConvertOverlayToPrimary, onMoveClip, activeTool = 'pointer', projectId = 1, isPlaying = false }: TimelineProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [pixelsPerSecond, setPixelsPerSecond] = useState(20); // Initial zoom level
   const [scrollX, setScrollX] = useState(0); // Horizontal scroll offset in pixels
   const [hoverX, setHoverX] = useState<number | null>(null); // Cursor X position for zoom anchoring
   const [hoverPlayheadTicks, setHoverPlayheadTicks] = useState<number | null>(null); // Hover playhead position in ticks
   const [dropPosition, setDropPosition] = useState<{ time: number; trackId: number; intent?: 'primary' | 'layered' } | null>(null);
-  const [trimState, setTrimState] = useState<{ clipId: string; edge: 'left' | 'right'; startX: number; originalIn: number; originalOut: number; originalStart: number } | null>(null);
+  const [trimState, setTrimState] = useState<{ clipId: string; edge: 'left' | 'right'; startX: number; originalIn: number; originalOut: number; originalStart: number; assetId: number; assetDurationTicks: number } | null>(null);
   const [hoveredEdge, setHoveredEdge] = useState<{ clipId: string; edge: 'left' | 'right' } | null>(null);
   const [loadedThumbnails, setLoadedThumbnails] = useState<Map<string, HTMLImageElement>>(new Map());
   
@@ -304,7 +329,19 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
 
     if (!timeline.tracks) return;
     
-    timeline.tracks.forEach((track) => {
+    // Separate tracks by kind: Caption (text) tracks first, then Video, then Audio
+    const captionTracks = timeline.tracks.filter(t => t.kind === 'Caption' || t.kind === 'caption');
+    const videoTracks = timeline.tracks.filter(t => t.kind === 'Video' || t.kind === 'video' || !t.kind);
+    const audioTracks = timeline.tracks.filter(t => t.kind === 'Audio' || t.kind === 'audio');
+    
+    // Separate video tracks into primary (track 1) and overlays (track_id > 1)
+    const primaryVideoTrack = videoTracks.find(t => (t.id || 1) === 1);
+    const overlayVideoTracks = videoTracks
+      .filter(t => (t.id || 1) > 1 && (t.clips?.length || 0) > 0) // Only show overlay tracks that have clips
+      .sort((a, b) => (a.id || 0) - (b.id || 0)); // Sort by ID ascending
+    
+    // Draw Caption tracks (text) - above video
+    captionTracks.forEach((track) => {
       // Draw track background (no labels - tracks are implicit)
       ctx.fillStyle = '#252525';
       ctx.fillRect(leftMargin, y, canvas.width - leftMargin, trackHeight);
@@ -335,15 +372,19 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
         let clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
         
         if (trimState && trimState.clipId === clipId) {
-          // Show trim preview
+          // Show trim preview - allow both inward and outward trimming
           if (trimState.edge === 'left') {
             const newIn = (trimState.originalIn + (hoverX! - trimState.startX) / pixelsPerSecond * TICKS_PER_SECOND);
-            const constrainedIn = Math.max(0, Math.min(newIn, trimState.originalOut - TICKS_PER_SECOND)); // Min 1 second
-            clipStartTime = (trimState.originalStart + (constrainedIn - trimState.originalIn) / TICKS_PER_SECOND) / TICKS_PER_SECOND;
+            // Allow extending outward (negative newIn) up to 0, or trimming inward up to originalOut - 1 second
+            const constrainedIn = Math.max(0, Math.min(newIn, trimState.originalOut - TICKS_PER_SECOND));
+            // Calculate timeline start adjustment (moves left when extending outward)
+            const inAdjustment = constrainedIn - trimState.originalIn;
+            clipStartTime = (trimState.originalStart + inAdjustment / TICKS_PER_SECOND) / TICKS_PER_SECOND;
             clipDuration = (trimState.originalOut - constrainedIn) / TICKS_PER_SECOND;
           } else {
             const newOut = (trimState.originalOut + (hoverX! - trimState.startX) / pixelsPerSecond * TICKS_PER_SECOND);
-            const constrainedOut = Math.min(newOut, trimState.originalOut + 1000 * TICKS_PER_SECOND); // Max asset duration
+            // Allow extending outward up to asset duration, or trimming inward to originalIn + 1 second
+            const constrainedOut = Math.max(trimState.originalIn + TICKS_PER_SECOND, Math.min(newOut, trimState.assetDurationTicks));
             clipDuration = (constrainedOut - trimState.originalIn) / TICKS_PER_SECOND;
           }
         }
@@ -356,95 +397,41 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
         const clipHeight = trackHeight - 10;
         const radius = 6;
         
-        // Set up clipping path for rounded rectangle
+        // Draw text clip (purple background with text)
         ctx.save();
         drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
         ctx.clip();
         
-        // Draw thumbnails as filmstrip - fill entire clip area with no gaps
-        let hasThumbnails = false;
-        if (width >= 80) { // Only show thumbnails if clip is wide enough
-          const thumbSpacingPx = 80; // Spacing between thumbnail samples
-          const numThumbs = Math.ceil(width / thumbSpacingPx); // Use ceil to ensure full coverage
-          
-          if (numThumbs > 0) {
-            // Calculate source time range for this clip
-            const sourceStartTime = clip.in_ticks / TICKS_PER_SECOND;
-            const sourceEndTime = clip.out_ticks / TICKS_PER_SECOND;
-            const sourceDuration = sourceEndTime - sourceStartTime;
-            
-            // Draw thumbnails continuously to fill entire width with no gaps
-            for (let i = 0; i < numThumbs; i++) {
-              // Calculate segment boundaries - ensure no gaps
-              const segmentStart = x + (i * thumbSpacingPx);
-              const segmentEnd = i === numThumbs - 1 
-                ? x + width  // Last segment goes to end of clip
-                : x + ((i + 1) * thumbSpacingPx);  // Regular segments
-              const segmentWidth = segmentEnd - segmentStart;
-              
-              // Only draw if segment is visible in viewport
-              if (segmentEnd >= leftMargin && segmentStart <= canvas.width && segmentWidth > 0) {
-                // Calculate source time for this thumbnail
-                const sampleTime = sourceStartTime + (i / Math.max(1, numThumbs - 1)) * sourceDuration;
-                const timestampSec = Math.floor(sampleTime);
-                
-                // Try to get thumbnail from cache
-                const cacheKey = `${clip.asset_id}_${timestampSec}`;
-                const thumbnail = thumbnailCache.get(cacheKey);
-                
-                if (thumbnail && thumbnail.complete && thumbnail.naturalWidth > 0) {
-                  hasThumbnails = true;
-                  
-                  // Draw thumbnail to fill the entire segment area (cover mode, no gaps)
-                  const thumbAspect = thumbnail.width / thumbnail.height;
-                  const targetAspect = segmentWidth / clipHeight;
-                  
-                  let drawWidth = segmentWidth;
-                  let drawHeight = clipHeight;
-                  let drawX = segmentStart;
-                  let drawY = clipY;
-                  
-                  // Use cover mode to fill entire segment area - extend beyond boundaries to avoid gaps
-                  if (thumbAspect > targetAspect) {
-                    // Thumbnail is wider - fit to height, extend width to cover
-                    drawWidth = clipHeight * thumbAspect;
-                    drawX = segmentStart - (drawWidth - segmentWidth) / 2;
-                  } else {
-                    // Thumbnail is taller - fit to width, extend height to cover
-                    drawHeight = segmentWidth / thumbAspect;
-                    drawY = clipY - (drawHeight - clipHeight) / 2;
-                  }
-                  
-                  // Draw the thumbnail to fill this segment completely
-                  ctx.drawImage(thumbnail, drawX, drawY, drawWidth, drawHeight);
-                } else {
-                  // Thumbnail not loaded yet - load it asynchronously
-                  loadThumbnail(clip.asset_id, timestampSec, projectId).then((img) => {
-                    if (img && canvasRef.current) {
-                      // Trigger re-render to draw the loaded thumbnail
-                      setLoadedThumbnails((prev) => {
-                        const newMap = new Map(prev);
-                        newMap.set(cacheKey, img);
-                        return newMap;
-                      });
-                    }
-                  });
-                }
-              }
-            }
-          }
-        }
-        
-        // Only draw colored background if no thumbnails are available
-        if (!hasThumbnails) {
-          ctx.fillStyle = isSelected ? '#10b981' : '#3b82f6';
-          ctx.fillRect(x, clipY, width, clipHeight);
-        }
+        // Draw purple background for text clip
+        ctx.fillStyle = isSelected ? '#a855f7' : '#9333ea';
+        ctx.fillRect(x, clipY, width, clipHeight);
         
         ctx.restore();
+        
+        // Draw text content if available (prefer text_content from backend)
+        const textContent = clip.text_content || clip.text || clip.defaultText || 'Add text';
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const maxTextWidth = width - 10;
+        const textX = x + width / 2;
+        const textY = y + trackHeight / 2;
+        
+        // Truncate text if too long
+        let displayText = textContent;
+        const metrics = ctx.measureText(displayText);
+        if (metrics.width > maxTextWidth) {
+          // Truncate with ellipsis
+          while (ctx.measureText(displayText + '...').width > maxTextWidth && displayText.length > 0) {
+            displayText = displayText.slice(0, -1);
+          }
+          displayText += '...';
+        }
+        ctx.fillText(displayText, textX, textY);
 
-        // Draw border on top - yellow if selected
-        ctx.strokeStyle = isSelected ? '#fbbf24' : '#2563eb';
+        // Draw border on top - yellow if selected, purple otherwise
+        ctx.strokeStyle = isSelected ? '#fbbf24' : '#a855f7';
         ctx.lineWidth = isSelected ? 3 : 1;
         drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
         ctx.stroke();
@@ -467,8 +454,316 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
 
       y += trackHeight + trackSpacing;
     });
+    
+    // Helper function to draw a video track (used for both overlays and primary)
+    const drawVideoTrack = (track: any, trackY: number) => {
+      // Draw track background
+      ctx.fillStyle = '#252525';
+      ctx.fillRect(leftMargin, trackY, canvas.width - leftMargin, trackHeight);
 
-    // Draw ghost preview when dragging
+      // Draw track border
+      ctx.strokeStyle = '#404040';
+      ctx.strokeRect(leftMargin, trackY, canvas.width - leftMargin, trackHeight);
+
+      // Draw clips
+      track.clips?.forEach((clip: any) => {
+        const clipId = clip.id || `${clip.asset_id}-${clip.timeline_start_ticks}`;
+        
+        // Skip drawing if this clip is being dragged
+        if (draggedClip && (draggedClip.clip.id === clipId || 
+            (draggedClip.clip.asset_id === clip.asset_id && 
+             draggedClip.clip.timeline_start_ticks === clip.timeline_start_ticks))) {
+          return;
+        }
+        
+        const isSelected = selectedClip && 
+          (selectedClip.id === clipId || 
+           (selectedClip.id === clip.id) ||
+           (selectedClip.asset_id === clip.asset_id && 
+            selectedClip.timeline_start_ticks === clip.timeline_start_ticks));
+        
+        // Calculate clip position - handle trimming
+        let clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+        let clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+        
+        if (trimState && trimState.clipId === clipId) {
+          if (trimState.edge === 'left') {
+            const newIn = (trimState.originalIn + (hoverX! - trimState.startX) / pixelsPerSecond * TICKS_PER_SECOND);
+            const constrainedIn = Math.max(0, Math.min(newIn, trimState.originalOut - TICKS_PER_SECOND));
+            const inAdjustment = constrainedIn - trimState.originalIn;
+            clipStartTime = (trimState.originalStart + inAdjustment / TICKS_PER_SECOND) / TICKS_PER_SECOND;
+            clipDuration = (trimState.originalOut - constrainedIn) / TICKS_PER_SECOND;
+          } else {
+            const newOut = (trimState.originalOut + (hoverX! - trimState.startX) / pixelsPerSecond * TICKS_PER_SECOND);
+            const constrainedOut = Math.max(trimState.originalIn + TICKS_PER_SECOND, Math.min(newOut, trimState.assetDurationTicks));
+            clipDuration = (constrainedOut - trimState.originalIn) / TICKS_PER_SECOND;
+          }
+        }
+        
+        const x = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+        const width = clipDuration * pixelsPerSecond;
+        
+        const clipY = trackY + 5;
+        const clipHeight = trackHeight - 10;
+        const radius = 6;
+        
+        ctx.save();
+        drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
+        ctx.clip();
+        
+        let hasThumbnails = false;
+        if (width >= 80) {
+          const thumbSpacingPx = 80;
+          const numThumbs = Math.ceil(width / thumbSpacingPx);
+          
+          if (numThumbs > 0) {
+            const sourceStartTime = clip.in_ticks / TICKS_PER_SECOND;
+            const sourceEndTime = clip.out_ticks / TICKS_PER_SECOND;
+            const sourceDuration = sourceEndTime - sourceStartTime;
+            
+            for (let i = 0; i < numThumbs; i++) {
+              const segmentStart = x + (i * thumbSpacingPx);
+              const segmentEnd = i === numThumbs - 1 ? x + width : x + ((i + 1) * thumbSpacingPx);
+              const segmentWidth = segmentEnd - segmentStart;
+              
+              if (segmentEnd >= leftMargin && segmentStart <= canvas.width && segmentWidth > 0) {
+                const sampleTime = sourceStartTime + (i / Math.max(1, numThumbs - 1)) * sourceDuration;
+                const timestampSec = Math.floor(sampleTime);
+                const cacheKey = `${clip.asset_id}_${timestampSec}`;
+                const thumbnail = thumbnailCache.get(cacheKey);
+                
+                if (thumbnail && thumbnail.complete && thumbnail.naturalWidth > 0) {
+                  hasThumbnails = true;
+                  const thumbAspect = thumbnail.width / thumbnail.height;
+                  const targetAspect = segmentWidth / clipHeight;
+                  
+                  let drawWidth = segmentWidth;
+                  let drawHeight = clipHeight;
+                  let drawX = segmentStart;
+                  let drawY = clipY;
+                  
+                  if (thumbAspect > targetAspect) {
+                    drawWidth = clipHeight * thumbAspect;
+                    drawX = segmentStart - (drawWidth - segmentWidth) / 2;
+                  } else {
+                    drawHeight = segmentWidth / thumbAspect;
+                    drawY = clipY - (drawHeight - clipHeight) / 2;
+                  }
+                  
+                  ctx.drawImage(thumbnail, drawX, drawY, drawWidth, drawHeight);
+                } else {
+                  loadThumbnail(clip.asset_id, timestampSec, projectId).then((img) => {
+                    if (img && canvasRef.current) {
+                      setLoadedThumbnails((prev) => {
+                        const newMap = new Map(prev);
+                        newMap.set(cacheKey, img);
+                        return newMap;
+                      });
+                    }
+                  });
+                }
+              }
+            }
+          }
+        }
+        
+        if (!hasThumbnails) {
+          ctx.fillStyle = isSelected ? '#10b981' : '#3b82f6';
+          ctx.fillRect(x, clipY, width, clipHeight);
+        }
+        
+        ctx.restore();
+
+        ctx.strokeStyle = isSelected ? '#fbbf24' : '#2563eb';
+        ctx.lineWidth = isSelected ? 3 : 1;
+        drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
+        ctx.stroke();
+        
+        if (activeTool === 'pointer' && (isSelected || hoveredEdge?.clipId === clipId)) {
+          const handleWidth = 5;
+          if (hoveredEdge && hoveredEdge.clipId === clipId && hoveredEdge.edge === 'left') {
+            ctx.fillStyle = '#10b981';
+            ctx.fillRect(x - handleWidth / 2, trackY + 5, handleWidth, trackHeight - 10);
+          }
+          if (hoveredEdge && hoveredEdge.clipId === clipId && hoveredEdge.edge === 'right') {
+            ctx.fillStyle = '#10b981';
+            ctx.fillRect(x + width - handleWidth / 2, trackY + 5, handleWidth, trackHeight - 10);
+          }
+        }
+      });
+    };
+    
+    // Calculate primary track Y position (will be set after overlays)
+    const primaryTrackY = y + (overlayVideoTracks.length * (trackHeight + trackSpacing));
+    
+    // Draw overlay tracks first (above primary, stacking upward)
+    // Render in reverse order so highest ID is closest to primary
+    [...overlayVideoTracks].reverse().forEach((track) => {
+      const trackIndex = overlayVideoTracks.indexOf(track);
+      const trackY = primaryTrackY - (trackHeight + trackSpacing) * (overlayVideoTracks.length - trackIndex);
+      drawVideoTrack(track, trackY);
+    });
+    
+    // Draw primary video track
+    if (primaryVideoTrack) {
+      drawVideoTrack(primaryVideoTrack, primaryTrackY);
+      y = primaryTrackY + trackHeight + trackSpacing;
+    } else {
+      // If no primary track exists, set y to where it would be
+      y = primaryTrackY + trackHeight + trackSpacing;
+    }
+
+    // Draw Audio tracks - below video
+    audioTracks.forEach((track) => {
+      ctx.fillStyle = '#252525';
+      ctx.fillRect(leftMargin, y, canvas.width - leftMargin, trackHeight);
+      ctx.strokeStyle = '#404040';
+      ctx.strokeRect(leftMargin, y, canvas.width - leftMargin, trackHeight);
+
+      track.clips?.forEach((clip: any) => {
+        const clipId = clip.id || `${clip.asset_id}-${clip.timeline_start_ticks}`;
+        
+        if (draggedClip && (draggedClip.clip.id === clipId || 
+            (draggedClip.clip.asset_id === clip.asset_id && 
+             draggedClip.clip.timeline_start_ticks === clip.timeline_start_ticks))) {
+          return;
+        }
+        
+        const isSelected = selectedClip && 
+          (selectedClip.id === clipId || 
+           (selectedClip.id === clip.id) ||
+           (selectedClip.asset_id === clip.asset_id && 
+            selectedClip.timeline_start_ticks === clip.timeline_start_ticks));
+        
+        let clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+        let clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+        
+        if (trimState && trimState.clipId === clipId) {
+          if (trimState.edge === 'left') {
+            const newIn = (trimState.originalIn + (hoverX! - trimState.startX) / pixelsPerSecond * TICKS_PER_SECOND);
+            const constrainedIn = Math.max(0, Math.min(newIn, trimState.originalOut - TICKS_PER_SECOND));
+            const inAdjustment = constrainedIn - trimState.originalIn;
+            clipStartTime = (trimState.originalStart + inAdjustment / TICKS_PER_SECOND) / TICKS_PER_SECOND;
+            clipDuration = (trimState.originalOut - constrainedIn) / TICKS_PER_SECOND;
+          } else {
+            const newOut = (trimState.originalOut + (hoverX! - trimState.startX) / pixelsPerSecond * TICKS_PER_SECOND);
+            const constrainedOut = Math.max(trimState.originalIn + TICKS_PER_SECOND, Math.min(newOut, trimState.assetDurationTicks));
+            clipDuration = (constrainedOut - trimState.originalIn) / TICKS_PER_SECOND;
+          }
+        }
+        
+        const x = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+        const width = clipDuration * pixelsPerSecond;
+        const clipY = y + 5;
+        const clipHeight = trackHeight - 10;
+        const radius = 6;
+        
+        ctx.save();
+        drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
+        ctx.clip();
+        
+        ctx.fillStyle = isSelected ? '#10b981' : '#059669';
+        ctx.fillRect(x, clipY, width, clipHeight);
+        
+        ctx.restore();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('🎵', x + width / 2, y + trackHeight / 2 + 4);
+        
+        ctx.strokeStyle = isSelected ? '#fbbf24' : '#10b981';
+        ctx.lineWidth = isSelected ? 3 : 1;
+        drawRoundedRect(ctx, x, clipY, width, clipHeight, radius);
+        ctx.stroke();
+        
+        if (activeTool === 'pointer' && (isSelected || hoveredEdge?.clipId === clipId)) {
+          const handleWidth = 5;
+          if (hoveredEdge && hoveredEdge.clipId === clipId && hoveredEdge.edge === 'left') {
+            ctx.fillStyle = '#10b981';
+            ctx.fillRect(x - handleWidth / 2, y + 5, handleWidth, trackHeight - 10);
+          }
+          if (hoveredEdge && hoveredEdge.clipId === clipId && hoveredEdge.edge === 'right') {
+            ctx.fillStyle = '#10b981';
+            ctx.fillRect(x + width - handleWidth / 2, y + 5, handleWidth, trackHeight - 10);
+          }
+        }
+      });
+
+      y += trackHeight + trackSpacing;
+    });
+
+    // Draw ghost preview when dragging text template
+    if (dragTextTemplate && dropPosition) {
+      const dropTime = dropPosition.time;
+      const insertX = leftMargin + (dropTime * pixelsPerSecond) - scrollX;
+      const defaultDuration = 3; // 3 seconds default for text clips
+      const previewWidth = defaultDuration * pixelsPerSecond;
+      const previewY = 50 + 5; // First caption track
+      const previewHeight = trackHeight - 10;
+      const radius = 6;
+      
+      if (insertX >= leftMargin && insertX <= canvas.width) {
+        // Purple overlay indicator for text
+        ctx.strokeStyle = '#a855f7';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(insertX, 30);
+        ctx.lineTo(insertX, Math.max(y, 50 + trackHeight));
+        ctx.stroke();
+        ctx.setLineDash([]);
+        
+        ctx.strokeStyle = '#a855f7';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 4]);
+        drawRoundedRect(ctx, insertX, previewY, previewWidth, previewHeight, radius);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        
+        ctx.fillStyle = 'rgba(168, 85, 247, 0.2)';
+        drawRoundedRect(ctx, insertX, previewY, previewWidth, previewHeight, radius);
+        ctx.fill();
+      }
+    }
+    
+    // Draw ghost preview when dragging audio asset
+    if (dragAudioAsset && dropPosition) {
+      const dropTime = dropPosition.time;
+      const insertX = leftMargin + (dropTime * pixelsPerSecond) - scrollX;
+      const previewWidth = Math.max(20, (dragAudioAsset.duration_ticks / TICKS_PER_SECOND) * pixelsPerSecond);
+      // Find first audio track Y position (after video tracks)
+      const numCaptionTracks = captionTracks.length;
+      const numVideoTracks = videoTracks.length;
+      const audioTrackY = 50 + (numCaptionTracks + numVideoTracks) * (trackHeight + trackSpacing);
+      const previewY = audioTrackY + 5;
+      const previewHeight = trackHeight - 10;
+      const radius = 6;
+      
+      if (insertX >= leftMargin && insertX <= canvas.width) {
+        // Green overlay indicator for audio
+        ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(insertX, 30);
+        ctx.lineTo(insertX, Math.max(y, audioTrackY + trackHeight));
+        ctx.stroke();
+        ctx.setLineDash([]);
+        
+        ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 4]);
+        drawRoundedRect(ctx, insertX, previewY, previewWidth, previewHeight, radius);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        
+        ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
+        drawRoundedRect(ctx, insertX, previewY, previewWidth, previewHeight, radius);
+        ctx.fill();
+      }
+    }
+
+    // Draw ghost preview when dragging video asset
     if (dragAsset && dropPosition) {
       const dropTime = dropPosition.time;
       const insertX = leftMargin + (dropTime * pixelsPerSecond) - scrollX;
@@ -516,6 +811,51 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
           ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
           drawRoundedRect(ctx, insertX, previewY, previewWidth, previewHeight, radius);
           ctx.fill();
+          
+          // Highlight underlying primary clip at drop time
+          if (timeline && timeline.tracks) {
+            const primaryTrack = timeline.tracks.find(t => (t.id || 1) === 1);
+            if (primaryTrack && primaryTrack.clips) {
+              const dropTime = dropPosition.time;
+              const dropTimeTicks = dropTime * TICKS_PER_SECOND;
+              
+              // Find the primary clip at drop time
+              for (const clip of primaryTrack.clips) {
+                const clipStartTicks = clip.timeline_start_ticks;
+                const clipDuration = clip.out_ticks - clip.in_ticks;
+                const clipEndTicks = clipStartTicks + clipDuration;
+                
+                if (dropTimeTicks >= clipStartTicks && dropTimeTicks < clipEndTicks) {
+                  // This is the underlying clip - highlight it
+                  const clipStartTime = clipStartTicks / TICKS_PER_SECOND;
+                  const clipDurationSec = clipDuration / TICKS_PER_SECOND;
+                  const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+                  const clipWidth = clipDurationSec * pixelsPerSecond;
+                  const clipY = dropY + 5;
+                  const clipHeight = trackHeight - 10;
+                  
+                  // Draw highlight overlay on primary clip
+                  ctx.fillStyle = 'rgba(59, 130, 246, 0.15)';
+                  drawRoundedRect(ctx, clipX, clipY, clipWidth, clipHeight, radius);
+                  ctx.fill();
+                  
+                  // Draw connection line from overlay to primary clip
+                  const overlayCenterY = previewY + previewHeight / 2;
+                  const primaryCenterY = clipY + clipHeight / 2;
+                  ctx.strokeStyle = '#3b82f6';
+                  ctx.lineWidth = 1.5;
+                  ctx.setLineDash([3, 3]);
+                  ctx.beginPath();
+                  ctx.moveTo(insertX, overlayCenterY);
+                  ctx.lineTo(insertX, primaryCenterY);
+                  ctx.stroke();
+                  ctx.setLineDash([]);
+                  
+                  break;
+                }
+              }
+            }
+          }
         } else {
           // Primary insert - green color, show ripple preview
           ctx.strokeStyle = '#10b981';
@@ -577,14 +917,24 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       const dropX = leftMargin + (dropTime * pixelsPerSecond) - scrollX;
       const trackHeight = 60;
       const trackSpacing = 10;
-      const primaryTrackY = 50;
-      const previewY = primaryTrackY + 5;
+      
+      // Calculate primary track Y position (accounting for caption tracks and existing overlay tracks)
+      const captionTracks = timeline.tracks?.filter(t => t.kind === 'Caption' || t.kind === 'caption') || [];
+      const existingOverlayTracks = timeline.tracks?.filter(t => 
+        (t.kind === 'Video' || t.kind === 'video' || !t.kind) && 
+        (t.id || 1) > 1 && 
+        (t.clips?.length || 0) > 0
+      ) || [];
+      const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing)) + (existingOverlayTracks.length * (trackHeight + trackSpacing));
+      
       const previewHeight = trackHeight - 10;
       const radius = 6;
       const previewWidth = clipDuration * pixelsPerSecond;
       
       if (dropX >= leftMargin && dropX <= canvas.width) {
         if (clipDropPosition.intent === 'primary') {
+          // Primary reorder - show on primary track
+          const previewY = primaryTrackY + 5;
           // Primary reorder - show insertion indicator and ripple preview
           // Draw insertion indicator (vertical line)
           ctx.strokeStyle = '#10b981';
@@ -596,15 +946,19 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
           ctx.stroke();
           ctx.setLineDash([]);
           
-          // Draw ghost preview of dragged clip
+          // Add track highlight on primary track
+          ctx.fillStyle = 'rgba(16, 185, 129, 0.08)';
+          ctx.fillRect(leftMargin, primaryTrackY, canvas.width - leftMargin, trackHeight);
+          
+          // Draw ghost preview of dragged clip (more prominent)
           ctx.strokeStyle = '#10b981';
-          ctx.lineWidth = 2;
+          ctx.lineWidth = 3; // Increased from 2 for better visibility
           ctx.setLineDash([8, 4]);
           drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
           ctx.stroke();
           ctx.setLineDash([]);
           
-          ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
+          ctx.fillStyle = 'rgba(16, 185, 129, 0.25)'; // Increased opacity from 0.2
           drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
           ctx.fill();
           
@@ -654,7 +1008,11 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
             });
           }
         } else {
-          // Layered overlay - show different visual feedback
+          // Layered overlay - show preview above primary track
+          // Calculate overlay track Y position (above primary, accounting for existing overlays)
+          const overlayPreviewY = primaryTrackY - (trackHeight + trackSpacing);
+          
+          // Draw insertion line (vertical line at drop time)
           ctx.strokeStyle = '#3b82f6';
           ctx.lineWidth = 2;
           ctx.setLineDash([5, 5]);
@@ -664,16 +1022,72 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
           ctx.stroke();
           ctx.setLineDash([]);
           
+          // Draw overlay preview at the overlay track position (more prominent)
+          const overlayClipY = overlayPreviewY + 5;
+          
+          // Add track highlight on overlay track
+          ctx.fillStyle = 'rgba(59, 130, 246, 0.08)';
+          ctx.fillRect(leftMargin, overlayPreviewY, canvas.width - leftMargin, trackHeight);
+          
           ctx.strokeStyle = '#3b82f6';
-          ctx.lineWidth = 2;
+          ctx.lineWidth = 3; // Increased from 2 for better visibility
           ctx.setLineDash([8, 4]);
-          drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
+          drawRoundedRect(ctx, dropX, overlayClipY, previewWidth, previewHeight, radius);
           ctx.stroke();
           ctx.setLineDash([]);
           
-          ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
-          drawRoundedRect(ctx, dropX, previewY, previewWidth, previewHeight, radius);
+          ctx.fillStyle = 'rgba(59, 130, 246, 0.25)'; // Increased opacity from 0.2
+          drawRoundedRect(ctx, dropX, overlayClipY, previewWidth, previewHeight, radius);
           ctx.fill();
+          
+          // Highlight underlying primary clip at drop time
+          if (timeline && timeline.tracks) {
+            const primaryTrack = timeline.tracks.find(t => (t.id || 1) === 1);
+            if (primaryTrack && primaryTrack.clips) {
+              const dropTime = clipDropPosition.time;
+              const dropTimeTicks = dropTime * TICKS_PER_SECOND;
+              
+              // Find the primary clip at drop time
+              for (const clip of primaryTrack.clips) {
+                const clipStartTicks = clip.timeline_start_ticks;
+                const clipDuration = clip.out_ticks - clip.in_ticks;
+                const clipEndTicks = clipStartTicks + clipDuration;
+                
+                if (dropTimeTicks >= clipStartTicks && dropTimeTicks < clipEndTicks) {
+                  // This is the underlying clip - highlight it
+                  const clipStartTime = clipStartTicks / TICKS_PER_SECOND;
+                  const clipDurationSec = clipDuration / TICKS_PER_SECOND;
+                  const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+                  const clipWidth = clipDurationSec * pixelsPerSecond;
+                  const clipY = primaryTrackY + 5;
+                  const clipHeight = trackHeight - 10;
+                  
+                  // Draw highlight overlay on primary clip
+                  ctx.fillStyle = 'rgba(59, 130, 246, 0.15)';
+                  drawRoundedRect(ctx, clipX, clipY, clipWidth, clipHeight, radius);
+                  ctx.fill();
+                  
+                  // Draw connection line from overlay to primary clip (more prominent)
+                  const overlayCenterY = overlayClipY + previewHeight / 2;
+                  const primaryCenterY = clipY + clipHeight / 2;
+                  ctx.strokeStyle = '#3b82f6';
+                  ctx.lineWidth = 2.5; // Increased from 1.5 for better visibility
+                  ctx.setLineDash([4, 4]); // Slightly longer dashes
+                  ctx.beginPath();
+                  ctx.moveTo(dropX, overlayCenterY);
+                  ctx.lineTo(dropX, primaryCenterY);
+                  ctx.stroke();
+                  ctx.setLineDash([]);
+                  
+                  // Add track highlight on primary track
+                  ctx.fillStyle = 'rgba(59, 130, 246, 0.08)';
+                  ctx.fillRect(leftMargin, primaryTrackY, canvas.width - leftMargin, trackHeight);
+                  
+                  break;
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -779,12 +1193,26 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     // Handle pointer tool - Final Cut behavior: clicking always moves playhead
     const trackHeight = 60;
     const trackSpacing = 10;
-    let currentY = 50;
     let clickedClip: any = null;
     
-    // Find clicked clip if any
+    // Find clicked clip - must match rendering order: caption, overlay, primary, audio
     if (timeline.tracks) {
-      for (const track of timeline.tracks) {
+      // Separate tracks by kind to match rendering order
+      const captionTracks = timeline.tracks.filter(t => t.kind === 'Caption' || t.kind === 'caption');
+      const videoTracks = timeline.tracks.filter(t => t.kind === 'Video' || t.kind === 'video' || !t.kind);
+      const audioTracks = timeline.tracks.filter(t => t.kind === 'Audio' || t.kind === 'audio');
+      
+      // Separate video tracks into primary and overlays
+      // Match rendering: sort ascending, then reverse when iterating
+      const primaryVideoTrack = videoTracks.find(t => (t.id || 1) === 1);
+      const overlayVideoTracks = videoTracks
+        .filter(t => (t.id || 1) > 1 && (t.clips?.length || 0) > 0)
+        .sort((a, b) => (a.id || 0) - (b.id || 0)); // Sort ascending (matches rendering)
+      
+      let currentY = 50;
+      
+      // Check caption tracks first
+      for (const track of captionTracks) {
         if (y >= currentY && y <= currentY + trackHeight) {
           for (const clip of track.clips || []) {
             const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
@@ -797,8 +1225,78 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
               break;
             }
           }
+          if (clickedClip) break;
         }
         currentY += trackHeight + trackSpacing;
+      }
+      
+      // Check overlay video tracks (top to bottom) - rendered ABOVE primary track
+      // Match rendering: iterate in reverse order (highest ID closest to primary)
+      if (!clickedClip) {
+        const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing));
+        // Iterate in reverse order to match rendering
+        for (let i = overlayVideoTracks.length - 1; i >= 0; i--) {
+          const track = overlayVideoTracks[i];
+          const trackIndex = overlayVideoTracks.indexOf(track);
+          // Match rendering calculation exactly
+          const trackY = primaryTrackY - (trackHeight + trackSpacing) * (overlayVideoTracks.length - trackIndex);
+          if (y >= trackY && y <= trackY + trackHeight) {
+            for (const clip of track.clips || []) {
+              const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+              const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+              const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+              const clipWidth = clipDuration * pixelsPerSecond;
+              
+              if (x >= clipX && x <= clipX + clipWidth) {
+                clickedClip = clip;
+                break;
+              }
+            }
+            if (clickedClip) break;
+          }
+        }
+      }
+      
+      // Check primary video track
+      if (!clickedClip && primaryVideoTrack) {
+        const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing));
+        if (y >= primaryTrackY && y <= primaryTrackY + trackHeight) {
+          for (const clip of primaryVideoTrack.clips || []) {
+            const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+            const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+            const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+            const clipWidth = clipDuration * pixelsPerSecond;
+            
+            if (x >= clipX && x <= clipX + clipWidth) {
+              clickedClip = clip;
+              break;
+            }
+          }
+        }
+      }
+      
+      // Check audio tracks
+      if (!clickedClip) {
+        const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing));
+        const videoTracksY = primaryTrackY + (primaryVideoTrack ? trackHeight + trackSpacing : 0) + (overlayVideoTracks.length * (trackHeight + trackSpacing));
+        currentY = videoTracksY;
+        for (const track of audioTracks) {
+          if (y >= currentY && y <= currentY + trackHeight) {
+            for (const clip of track.clips || []) {
+              const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+              const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+              const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+              const clipWidth = clipDuration * pixelsPerSecond;
+              
+              if (x >= clipX && x <= clipX + clipWidth) {
+                clickedClip = clip;
+                break;
+              }
+            }
+            if (clickedClip) break;
+          }
+          currentY += trackHeight + trackSpacing;
+        }
       }
     }
     
@@ -811,7 +1309,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     
     // If a clip was clicked, also select it
     if (clickedClip && onClipClick) {
-      onClipClick(clickedClip);
+      onClipClick(clickedClip, e);
     }
   };
 
@@ -890,7 +1388,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     }
 
     // Check if potential drag should become actual drag (requires intentional movement)
-    const DRAG_THRESHOLD = 8; // pixels - minimum movement to start dragging
+    const DRAG_THRESHOLD = 5; // pixels - minimum movement to start dragging (reduced for better responsiveness)
     if (potentialDrag && !draggedClip) {
       const moveDistance = Math.sqrt(
         Math.pow(mouseX - potentialDrag.startX, 2) + 
@@ -907,15 +1405,39 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     // Handle clip drag
     if (draggedClip && timeline && onClipReorder) {
       const leftMargin = 3 * PIXELS_PER_REM;
+      const trackHeight = 60;
+      const trackSpacing = 10;
       
-      // Require minimum horizontal drag distance before showing preview (10 pixels)
-      const minDragDistance = 10 / pixelsPerSecond; // Convert to seconds
+      // Calculate primary track Y position (accounting for caption tracks only)
+      // Don't account for existing overlay tracks since we might be creating a new one
+      const captionTracks = timeline.tracks?.filter(t => t.kind === 'Caption' || t.kind === 'caption') || [];
+      const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing));
+      const primaryTrackBottom = primaryTrackY + trackHeight;
+      
+      // Add buffer zone around primary track boundary for easier intent detection
+      // Buffer zone is 15 pixels above and below the primary track
+      const BUFFER_ZONE = 15;
+      const primaryTrackTopWithBuffer = primaryTrackY - BUFFER_ZONE;
+      const primaryTrackBottomWithBuffer = primaryTrackBottom + BUFFER_ZONE;
+      
+      // Detect intent based on absolute Y position with buffer zones (Final Cut style)
+      // If mouseY is above primary track (including buffer), it's overlay intent
+      // If mouseY is on or below primary track (including buffer), it's primary reorder intent
+      let intent: 'primary' | 'layered';
+      if (mouseY < primaryTrackTopWithBuffer) {
+        intent = 'layered'; // Clearly above primary track
+      } else if (mouseY > primaryTrackBottomWithBuffer) {
+        intent = 'primary'; // Clearly below primary track
+      } else {
+        // In buffer zone - use center of primary track as decision point
+        const primaryTrackCenter = primaryTrackY + (trackHeight / 2);
+        intent = mouseY < primaryTrackCenter ? 'layered' : 'primary';
+      }
+      
+      // Require minimum horizontal drag distance before showing preview (5 pixels for better responsiveness)
+      const minDragDistance = 5 / pixelsPerSecond; // Convert to seconds
       const horizontalDelta = Math.abs(mouseX - draggedClip.startX);
       const horizontalDeltaTime = horizontalDelta / pixelsPerSecond;
-      
-      // Detect intent based on vertical movement
-      const verticalDelta = Math.abs(mouseY - draggedClip.startY);
-      const intent: 'primary' | 'layered' = (verticalDelta > 20 && verticalDelta > horizontalDelta) ? 'layered' : 'primary';
       
       // Calculate drop time from mouse position
       let dropTime = (mouseX - leftMargin + scrollX) / pixelsPerSecond;
@@ -1030,7 +1552,9 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
           setClipDropPosition(null);
         }
       } else if (intent === 'layered') {
-        // For layered intent, use the drop time directly
+        // For layered intent, always show preview when dragging above primary track
+        // Don't require minimum drag distance - allow immediate preview
+        // Use the drop time directly (time where mouse is horizontally)
         setClipDropPosition({ time: dropTime, intent });
       } else {
         // Not enough drag distance or invalid intent, don't show preview
@@ -1046,7 +1570,7 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     }
 
     // Handle edge detection for trimming (only in pointer tool mode)
-    if (activeTool === 'pointer' && timeline && !dragAsset && !draggedClip && !potentialDrag) {
+    if (activeTool === 'pointer' && timeline && !dragAsset && !dragTextTemplate && !dragAudioAsset && !draggedClip && !potentialDrag) {
       let currentY = 50;
       let foundEdge = false;
       
@@ -1128,6 +1652,59 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
 
       const newDropPosition = { time: dropTime, trackId: targetTrackId, intent };
       setDropPosition(newDropPosition);
+    } else if (dragTextTemplate) {
+      // Text templates can be dropped on primary timeline OR above it
+      const hoverTime = (mouseX - leftMargin + scrollX) / pixelsPerSecond;
+      const dropTime = Math.max(0, hoverTime);
+      
+      // Define primary storyline Y bounds (track 1)
+      const primaryTrackY = 50;
+      const primaryTrackBottom = primaryTrackY + trackHeight;
+      
+      // Detect drop intent based on Y position
+      let intent: 'primary' | 'layered' = 'primary';
+      let targetTrackId = 1; // Default to primary track
+      
+      if (mouseY < primaryTrackY) {
+        // Dropping above primary track = layered intent (caption track above)
+        intent = 'layered';
+        // Find or create caption track (use track ID 2 for first caption track, or next available)
+        if (timeline && timeline.tracks && timeline.tracks.length > 0) {
+          const captionTracks = timeline.tracks.filter(t => t.kind === 'Caption' || t.kind === 'caption');
+          if (captionTracks.length > 0) {
+            targetTrackId = Math.max(...captionTracks.map(t => t.id || 2));
+          } else {
+            targetTrackId = 2; // First caption track
+          }
+        } else {
+          targetTrackId = 2; // First caption track
+        }
+      } else if (mouseY >= primaryTrackY && mouseY <= primaryTrackBottom) {
+        // Dropping on primary track = primary intent (insert into primary timeline)
+        intent = 'primary';
+        targetTrackId = 1;
+      } else {
+        // Dropping below primary track = still primary (append to end)
+        intent = 'primary';
+        targetTrackId = 1;
+      }
+      
+      setDropPosition({ time: dropTime, trackId: targetTrackId, intent });
+    } else if (dragAudioAsset) {
+      // Audio assets always overlay (no ripple)
+      const hoverTime = (mouseX - leftMargin + scrollX) / pixelsPerSecond;
+      const dropTime = Math.max(0, hoverTime);
+      // Find or create audio track (use track ID after video tracks)
+      let targetTrackId = 10; // Start audio tracks at ID 10
+      if (timeline && timeline.tracks && timeline.tracks.length > 0) {
+        const audioTracks = timeline.tracks.filter(t => t.kind === 'Audio' || t.kind === 'audio');
+        if (audioTracks.length > 0) {
+          targetTrackId = Math.max(...audioTracks.map(t => t.id || 10));
+        } else {
+          targetTrackId = 10; // First audio track
+        }
+      }
+      setDropPosition({ time: dropTime, trackId: targetTrackId, intent: 'layered' });
     } else {
       // Clear drop position when not dragging
       if (dropPosition) {
@@ -1161,14 +1738,36 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
         for (const clip of track.clips || []) {
           const clipId = clip.id || `${clip.asset_id}-${clip.timeline_start_ticks}`;
           if (clipId === hoveredEdge.clipId) {
-            setTrimState({
-              clipId,
-              edge: hoveredEdge.edge,
-              startX: x,
-              originalIn: clip.in_ticks,
-              originalOut: clip.out_ticks,
-              originalStart: clip.timeline_start_ticks,
-            });
+            // Fetch asset duration to know how far we can extend outward
+            fetch(`http://127.0.0.1:7777/api/projects/${projectId}/media`)
+              .then(res => res.json())
+              .then((assets: any[]) => {
+                const asset = assets.find((a: any) => a.id === clip.asset_id);
+                const assetDurationTicks = asset?.duration_ticks || clip.out_ticks; // Fallback to current out if not found
+                setTrimState({
+                  clipId,
+                  edge: hoveredEdge.edge,
+                  startX: x,
+                  originalIn: clip.in_ticks,
+                  originalOut: clip.out_ticks,
+                  originalStart: clip.timeline_start_ticks,
+                  assetId: clip.asset_id,
+                  assetDurationTicks,
+                });
+              })
+              .catch(() => {
+                // On error, use current out_ticks as max (can't extend outward)
+                setTrimState({
+                  clipId,
+                  edge: hoveredEdge.edge,
+                  startX: x,
+                  originalIn: clip.in_ticks,
+                  originalOut: clip.out_ticks,
+                  originalStart: clip.timeline_start_ticks,
+                  assetId: clip.asset_id,
+                  assetDurationTicks: clip.out_ticks,
+                });
+              });
             return;
           }
         }
@@ -1177,9 +1776,25 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     
     // Check for potential clip drag (click on clip body, not edge)
     // Don't start dragging immediately - wait for intentional movement
-    if (!hoveredEdge && onClipReorder) {
+    // Must match rendering order: caption, overlay, primary, audio
+    if (!hoveredEdge && (onClipReorder || onConvertPrimaryToOverlay || onConvertOverlayToPrimary || onMoveClip)) {
+      // Separate tracks by kind to match rendering order
+      const captionTracks = timeline.tracks?.filter(t => t.kind === 'Caption' || t.kind === 'caption') || [];
+      const videoTracks = timeline.tracks?.filter(t => t.kind === 'Video' || t.kind === 'video' || !t.kind) || [];
+      const audioTracks = timeline.tracks?.filter(t => t.kind === 'Audio' || t.kind === 'audio') || [];
+      
+      // Separate video tracks into primary and overlays
+      // Match rendering: sort ascending, then reverse when iterating
+      const primaryVideoTrack = videoTracks.find(t => (t.id || 1) === 1);
+      const overlayVideoTracks = videoTracks
+        .filter(t => (t.id || 1) > 1 && (t.clips?.length || 0) > 0)
+        .sort((a, b) => (a.id || 0) - (b.id || 0)); // Sort ascending (matches rendering)
+      
+      let foundClip = false;
       let currentY = 50;
-      for (const track of timeline.tracks || []) {
+      
+      // Check caption tracks first
+      for (const track of captionTracks) {
         if (y >= currentY && y <= currentY + trackHeight) {
           for (const clip of track.clips || []) {
             const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
@@ -1190,7 +1805,6 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
             // Check if click is on clip body (not near edges)
             if (x >= clipX + edgeThreshold && x <= clipX + clipWidth - edgeThreshold && 
                 x >= clipX && x <= clipX + clipWidth) {
-              // Store potential drag - will only start if user moves mouse significantly
               const offsetX = x - clipX;
               setPotentialDrag({
                 clip,
@@ -1199,11 +1813,110 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
                 offsetX,
                 originalPosition: clip.timeline_start_ticks,
               });
-              return;
+              foundClip = true;
+              break;
+            }
+          }
+          if (foundClip) break;
+        }
+        currentY += trackHeight + trackSpacing;
+      }
+      
+      // Check overlay video tracks (top to bottom) - rendered ABOVE primary track
+      // Match rendering: iterate in reverse order (highest ID closest to primary)
+      if (!foundClip) {
+        const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing));
+        // Iterate in reverse order to match rendering
+        for (let i = overlayVideoTracks.length - 1; i >= 0; i--) {
+          const track = overlayVideoTracks[i];
+          const trackIndex = overlayVideoTracks.indexOf(track);
+          // Match rendering calculation exactly
+          const trackY = primaryTrackY - (trackHeight + trackSpacing) * (overlayVideoTracks.length - trackIndex);
+          if (y >= trackY && y <= trackY + trackHeight) {
+            for (const clip of track.clips || []) {
+              const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+              const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+              const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+              const clipWidth = clipDuration * pixelsPerSecond;
+              
+              // Check if click is on clip body - allow dragging from anywhere on clip (no edge threshold for video)
+              if (x >= clipX && x <= clipX + clipWidth) {
+                const offsetX = x - clipX;
+                setPotentialDrag({
+                  clip,
+                  startX: x,
+                  startY: y,
+                  offsetX,
+                  originalPosition: clip.timeline_start_ticks,
+                });
+                foundClip = true;
+                break;
+              }
+            }
+            if (foundClip) break;
+          }
+        }
+      }
+      
+      // Check primary video track
+      if (!foundClip && primaryVideoTrack) {
+        const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing));
+        if (y >= primaryTrackY && y <= primaryTrackY + trackHeight) {
+          for (const clip of primaryVideoTrack.clips || []) {
+            const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+            const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+            const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+            const clipWidth = clipDuration * pixelsPerSecond;
+            
+            // Check if click is on clip body (not near edges) - allow dragging from anywhere on clip
+            if (x >= clipX && x <= clipX + clipWidth) {
+              const offsetX = x - clipX;
+              setPotentialDrag({
+                clip,
+                startX: x,
+                startY: y,
+                offsetX,
+                originalPosition: clip.timeline_start_ticks,
+              });
+              foundClip = true;
+              break;
             }
           }
         }
-        currentY += trackHeight + trackSpacing;
+      }
+      
+      // Check audio tracks
+      if (!foundClip) {
+        const primaryTrackY = 50 + (captionTracks.length * (trackHeight + trackSpacing));
+        const videoTracksY = primaryTrackY + (primaryVideoTrack ? trackHeight + trackSpacing : 0) + (overlayVideoTracks.length * (trackHeight + trackSpacing));
+        currentY = videoTracksY;
+        for (const track of audioTracks) {
+          if (y >= currentY && y <= currentY + trackHeight) {
+            for (const clip of track.clips || []) {
+              const clipStartTime = clip.timeline_start_ticks / TICKS_PER_SECOND;
+              const clipDuration = (clip.out_ticks - clip.in_ticks) / TICKS_PER_SECOND;
+              const clipX = leftMargin + (clipStartTime * pixelsPerSecond) - scrollX;
+              const clipWidth = clipDuration * pixelsPerSecond;
+              
+              // Check if click is on clip body (not near edges)
+              if (x >= clipX + edgeThreshold && x <= clipX + clipWidth - edgeThreshold && 
+                  x >= clipX && x <= clipX + clipWidth) {
+                const offsetX = x - clipX;
+                setPotentialDrag({
+                  clip,
+                  startX: x,
+                  startY: y,
+                  offsetX,
+                  originalPosition: clip.timeline_start_ticks,
+                });
+                foundClip = true;
+                break;
+              }
+            }
+            if (foundClip) break;
+          }
+          currentY += trackHeight + trackSpacing;
+        }
       }
     }
   };
@@ -1211,14 +1924,40 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
   // Global mouseup handler for drag drop (handles case where mouse leaves canvas)
   useEffect(() => {
     const handleGlobalMouseUp = (e: MouseEvent) => {
-      // Handle clip reorder drop
-      if (draggedClip && clipDropPosition && onClipReorder) {
+      // Handle clip reorder drop or primary → overlay conversion
+      if (draggedClip && clipDropPosition) {
         const clipId = draggedClip.clip.id || `${draggedClip.clip.asset_id}-${draggedClip.clip.timeline_start_ticks}`;
         const positionTicks = Math.round(clipDropPosition.time * TICKS_PER_SECOND);
         
-        // Only reorder if position changed and intent is primary
-        if (clipDropPosition.intent === 'primary' && positionTicks !== draggedClip.originalPosition) {
+        // Check if this is a primary clip or overlay clip
+        // Check both track_id property and if clip exists in primary track
+        const primaryTrack = timeline?.tracks?.find(t => (t.id || 1) === 1);
+        const isPrimaryClip = (draggedClip.clip.track_id === 1) || 
+                             (primaryTrack?.clips?.some((c: any) => c.id === clipId) ?? false);
+        const isOverlayClip = !isPrimaryClip && (draggedClip.clip.track_id && draggedClip.clip.track_id > 1);
+        
+        if (clipDropPosition.intent === 'layered') {
+          console.log('Global mouseup: Layered intent detected', { clipId, positionTicks, isPrimaryClip, hasConvertHandler: !!onConvertPrimaryToOverlay, hasMoveHandler: !!onMoveClip });
+          if (isPrimaryClip && onConvertPrimaryToOverlay) {
+            // Convert primary clip to overlay
+            console.log('Global mouseup: Calling onConvertPrimaryToOverlay');
+            onConvertPrimaryToOverlay(clipId, positionTicks);
+          } else if (onMoveClip) {
+            // Move overlay clip to new position
+            console.log('Global mouseup: Calling onMoveClip');
+            onMoveClip(clipId, positionTicks);
+          } else {
+            console.warn('Global mouseup: No handler available for layered intent');
+          }
+        } else if (clipDropPosition.intent === 'primary') {
+          if (isOverlayClip && onConvertOverlayToPrimary) {
+            // Convert overlay clip to primary
+            console.log('Global mouseup: Calling onConvertOverlayToPrimary');
+            onConvertOverlayToPrimary(clipId, positionTicks);
+          } else if (isPrimaryClip && positionTicks !== draggedClip.originalPosition && onClipReorder) {
+            // Regular primary reorder
           onClipReorder(clipId, positionTicks);
+          }
         }
         
         setDraggedClip(null);
@@ -1230,6 +1969,56 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       // Clear potential drag if mouse is released without dragging
       if (potentialDrag) {
         setPotentialDrag(null);
+      }
+      
+      // Handle text template drop
+      if (dragTextTemplate && dropPosition && onTextClipInsert) {
+        if (canvasRef.current) {
+          const rect = canvasRef.current.getBoundingClientRect();
+          const mouseX = e.clientX - rect.left;
+          const mouseY = e.clientY - rect.top;
+          
+          if (mouseX >= 0 && mouseX <= rect.width && mouseY >= 0 && mouseY <= rect.height) {
+            e.preventDefault();
+            e.stopPropagation();
+            const positionTicks = Math.round(dropPosition.time * TICKS_PER_SECOND);
+            onTextClipInsert(dragTextTemplate, positionTicks, dropPosition.intent, dropPosition.trackId);
+            setDropPosition(null);
+            // Clear drag state immediately
+            if (onDragEnd) {
+              onDragEnd();
+            }
+          }
+        }
+        return;
+      }
+      
+      // Handle audio asset drop
+      if (dragAudioAsset && dropPosition && onAudioClipInsert) {
+        if (canvasRef.current) {
+          const rect = canvasRef.current.getBoundingClientRect();
+          const mouseX = e.clientX - rect.left;
+          const mouseY = e.clientY - rect.top;
+          
+          if (mouseX >= 0 && mouseX <= rect.width && mouseY >= 0 && mouseY <= rect.height) {
+            e.preventDefault();
+            e.stopPropagation();
+            const positionTicks = Math.round(dropPosition.time * TICKS_PER_SECOND);
+            onAudioClipInsert(dragAudioAsset, positionTicks);
+            setDropPosition(null);
+            // Clear drag state immediately
+            if (onDragEnd) {
+              onDragEnd();
+            }
+          }
+        }
+        return;
+      }
+      
+      // Clear drag state if mouse is released without a valid drop
+      if ((dragTextTemplate || dragAudioAsset) && !dropPosition && onDragEnd) {
+        onDragEnd();
+        setDropPosition(null);
       }
       
       // Only handle if we're dragging and have a drop position
@@ -1254,25 +2043,51 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       }
     };
 
-    if (dragAsset || draggedClip) {
+    if (dragAsset || draggedClip || dragTextTemplate || dragAudioAsset) {
       document.addEventListener('mouseup', handleGlobalMouseUp);
       return () => {
         document.removeEventListener('mouseup', handleGlobalMouseUp);
       };
     }
-  }, [dragAsset, dropPosition, onClipInsert, draggedClip, clipDropPosition, potentialDrag, onClipReorder, timeline, calculateEarliestNextTimestamp]);
+  }, [dragAsset, dropPosition, onClipInsert, draggedClip, clipDropPosition, potentialDrag, onClipReorder, onConvertPrimaryToOverlay, onConvertOverlayToPrimary, onMoveClip, timeline, calculateEarliestNextTimestamp, dragTextTemplate, dragAudioAsset, onTextClipInsert, onAudioClipInsert, onDragEnd]);
 
   const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    // Handle clip reorder drop
-    if (draggedClip && clipDropPosition && onClipReorder) {
+    // Handle clip reorder drop or primary → overlay conversion
+    if (draggedClip && clipDropPosition) {
       e.preventDefault();
       e.stopPropagation();
       const clipId = draggedClip.clip.id || `${draggedClip.clip.asset_id}-${draggedClip.clip.timeline_start_ticks}`;
       const positionTicks = Math.round(clipDropPosition.time * TICKS_PER_SECOND);
       
-      // Only reorder if position changed and intent is primary
-      if (clipDropPosition.intent === 'primary' && positionTicks !== draggedClip.originalPosition) {
+      // Check if this is a primary clip or overlay clip
+      // Check both track_id property and if clip exists in primary track
+      const primaryTrack = timeline?.tracks?.find(t => (t.id || 1) === 1);
+      const isPrimaryClip = (draggedClip.clip.track_id === 1) || 
+                           (primaryTrack?.clips?.some((c: any) => c.id === clipId) ?? false);
+      const isOverlayClip = !isPrimaryClip && (draggedClip.clip.track_id && draggedClip.clip.track_id > 1);
+      
+      if (clipDropPosition.intent === 'layered') {
+        console.log('Layered intent detected', { clipId, positionTicks, isPrimaryClip, hasConvertHandler: !!onConvertPrimaryToOverlay, hasMoveHandler: !!onMoveClip });
+        if (isPrimaryClip && onConvertPrimaryToOverlay) {
+          // Convert primary clip to overlay
+          console.log('Calling onConvertPrimaryToOverlay');
+          onConvertPrimaryToOverlay(clipId, positionTicks);
+        } else if (onMoveClip) {
+          // Move overlay clip to new position
+          console.log('Calling onMoveClip');
+          onMoveClip(clipId, positionTicks);
+        } else {
+          console.warn('No handler available for layered intent');
+        }
+      } else if (clipDropPosition.intent === 'primary') {
+        if (isOverlayClip && onConvertOverlayToPrimary) {
+          // Convert overlay clip to primary
+          console.log('Calling onConvertOverlayToPrimary');
+          onConvertOverlayToPrimary(clipId, positionTicks);
+        } else if (isPrimaryClip && positionTicks !== draggedClip.originalPosition && onClipReorder) {
+          // Regular primary reorder
         onClipReorder(clipId, positionTicks);
+        }
       }
       
       setDraggedClip(null);
@@ -1284,6 +2099,30 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
     // Clear potential drag if mouse is released without dragging
     if (potentialDrag) {
       setPotentialDrag(null);
+    }
+
+    // Handle text template drop
+    if (dragTextTemplate && dropPosition && onTextClipInsert) {
+      e.preventDefault();
+      e.stopPropagation();
+      const positionTicks = Math.round(dropPosition.time * TICKS_PER_SECOND);
+      onTextClipInsert(dragTextTemplate, positionTicks, dropPosition.intent, dropPosition.trackId);
+      setDropPosition(null);
+      // Clear drag state immediately
+      if (onDragEnd) {
+        onDragEnd();
+      }
+      return;
+    }
+    
+    // Handle audio asset drop
+    if (dragAudioAsset && dropPosition && onAudioClipInsert) {
+      e.preventDefault();
+      e.stopPropagation();
+      const positionTicks = Math.round(dropPosition.time * TICKS_PER_SECOND);
+      onAudioClipInsert(dragAudioAsset, positionTicks);
+      setDropPosition(null);
+      return;
     }
 
     // Handle drag drop
@@ -1311,9 +2150,11 @@ export function Timeline({ timeline, selectedClip, onClipClick, playheadPosition
       let newOut = trimState.originalOut;
       
       if (trimState.edge === 'left') {
+        // Allow extending outward (negative delta) up to 0, or trimming inward
         newIn = Math.max(0, Math.min(trimState.originalIn + deltaTicks, trimState.originalOut - TICKS_PER_SECOND));
       } else {
-        newOut = Math.max(trimState.originalIn + TICKS_PER_SECOND, trimState.originalOut + deltaTicks);
+        // Allow extending outward up to asset duration, or trimming inward
+        newOut = Math.max(trimState.originalIn + TICKS_PER_SECOND, Math.min(trimState.originalOut + deltaTicks, trimState.assetDurationTicks));
       }
       
       onClipTrim(trimState.clipId, newIn, newOut);

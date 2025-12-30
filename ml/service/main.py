@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os
 
 app = FastAPI(title="VibeCut ML Service", version="0.1.0")
@@ -241,6 +241,167 @@ async def analyze_vision(request: VisionAnalyzeRequest) -> VisionAnalyzeResponse
         raise HTTPException(status_code=500, detail=f"Vision analysis failed: {str(e)}")
 
 
+class EmbeddingRequest(BaseModel):
+    text: str
+
+
+class EmbeddingResponse(BaseModel):
+    embedding: List[float]
+
+
+# Global model cache (singleton pattern)
+_text_model = None
+
+def get_text_model():
+    """Get or load the sentence-transformers model (singleton pattern)"""
+    global _text_model
+    if _text_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _text_model = SentenceTransformer('all-MiniLM-L6-v2')
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="sentence-transformers not installed. Run: pip install sentence-transformers"
+            )
+    return _text_model
+
+
+@app.post("/embeddings/text", response_model=EmbeddingResponse)
+async def embeddings_text(request: EmbeddingRequest) -> EmbeddingResponse:
+    """
+    Generate text embedding using sentence-transformers all-MiniLM-L6-v2.
+    Returns 384-dimensional vector.
+    
+    Args:
+        request: Contains text to embed (can be structured or plain text)
+    
+    Returns:
+        EmbeddingResponse with embedding vector
+    """
+    try:
+        model = get_text_model()
+        # Encode text with normalization (L2 normalization for cosine similarity)
+        embedding = model.encode(request.text, normalize_embeddings=True)
+        return EmbeddingResponse(embedding=embedding.tolist())
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text embedding generation failed: {str(e)}")
+
+
+# Keep old endpoint for backward compatibility during transition
+@app.post("/embeddings/semantic", response_model=EmbeddingResponse)
+async def embeddings_semantic(request: EmbeddingRequest) -> EmbeddingResponse:
+    """
+    DEPRECATED: Use /embeddings/text instead.
+    This endpoint is kept for backward compatibility.
+    """
+    # Delegate to new text endpoint
+    return await embeddings_text(request)
+
+
+class VisionEmbeddingRequest(BaseModel):
+    media_path: str
+    start_time: float  # Start time in seconds
+    end_time: float    # End time in seconds
+
+
+# Global vision model cache (singleton pattern)
+_vision_model = None
+_vision_preprocess = None
+
+def get_vision_model():
+    """Get or load the CLIP model (singleton pattern)"""
+    global _vision_model, _vision_preprocess
+    if _vision_model is None:
+        try:
+            import open_clip
+            import torch
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                'ViT-B-32', pretrained='openai'
+            )
+            model.eval()
+            _vision_model = model
+            _vision_preprocess = preprocess
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="open-clip-torch not installed. Run: pip install open-clip-torch torch"
+            )
+    return _vision_model, _vision_preprocess
+
+
+@app.post("/embeddings/vision", response_model=EmbeddingResponse)
+async def embeddings_vision(request: VisionEmbeddingRequest) -> EmbeddingResponse:
+    """
+    Generate vision embedding from keyframe using CLIP ViT-B-32.
+    Returns 512-dimensional vector.
+    
+    Args:
+        request: Contains media_path and time range for segment
+    
+    Returns:
+        EmbeddingResponse with embedding vector
+    """
+    try:
+        import cv2
+        import torch
+        from PIL import Image
+        import numpy as np
+        
+        # Validate path
+        if not os.path.exists(request.media_path):
+            raise HTTPException(status_code=404, detail=f"File not found: {request.media_path}")
+        
+        # Extract keyframe (middle frame of segment)
+        cap = cv2.VideoCapture(request.media_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=500, detail="Failed to open video file")
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            cap.release()
+            raise HTTPException(status_code=500, detail="Invalid video FPS")
+        
+        # Calculate frame number for middle of segment
+        middle_time = (request.start_time + request.end_time) / 2.0
+        frame_number = int(middle_time * fps)
+        
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret:
+            raise HTTPException(status_code=500, detail="Failed to extract frame")
+        
+        # Convert BGR to RGB for PIL
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        
+        # Get model and preprocess
+        model, preprocess = get_vision_model()
+        
+        # Preprocess image
+        image_tensor = preprocess(pil_image).unsqueeze(0)
+        
+        # Generate embedding
+        with torch.no_grad():
+            image_features = model.encode_image(image_tensor)
+            # Normalize for cosine similarity
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            embedding = image_features.squeeze(0).cpu().numpy().tolist()
+        
+        return EmbeddingResponse(embedding=embedding)
+        
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Required library not installed: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Vision embedding generation failed: {str(e)}")
+
+
 class ProfileFromReferencesRequest(BaseModel):
     referenceVideoPaths: List[str]
 
@@ -250,6 +411,126 @@ class StyleProfileResponse(BaseModel):
     caption_templates: List[dict]
     music: dict
     structure: dict
+
+
+class OrchestratorReasonRequest(BaseModel):
+    segments: List[dict]
+    style_profile: Optional[dict] = None
+    timeline_context: Optional[dict] = None
+
+
+class OrchestratorReasonResponse(BaseModel):
+    explanation: str
+    questions: List[str]
+    narrative_structure: Optional[str] = None
+
+
+@app.post("/orchestrator/reason", response_model=OrchestratorReasonResponse)
+async def orchestrator_reason(request: OrchestratorReasonRequest) -> OrchestratorReasonResponse:
+    """
+    Generate structured narrative reasoning. Returns analysis outputs only.
+    Daemon translates these into user-facing messages.
+    
+    Args:
+        request: Contains segments, optional style_profile, and optional timeline_context
+    
+    Returns:
+        OrchestratorReasonResponse with structured data only (empty explanation/questions - daemon generates these)
+    """
+    try:
+        # Extract segment information
+        segments = request.segments
+        num_segments = len(segments)
+        
+        if num_segments == 0:
+            return OrchestratorReasonResponse(
+                explanation="",  # Empty - daemon will generate message
+                questions=[],     # Empty - daemon will generate
+                narrative_structure=None
+            )
+        
+        # Return structured analysis only
+        # In a real implementation, this would use an LLM to generate structured reasoning
+        # For now, return basic structure
+        
+        return OrchestratorReasonResponse(
+            explanation="",  # Daemon generates friendly copy
+            questions=[],     # Daemon generates questions
+            narrative_structure="linear"  # Structured data
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Orchestrator reasoning failed: {str(e)}")
+
+
+class GeneratePlanRequest(BaseModel):
+    narrative_structure: str
+    beats: List[Dict]
+    constraints: Dict
+    style_profile_id: Optional[int] = None
+
+
+@app.post("/orchestrator/generate_plan")
+async def generate_plan(request: GeneratePlanRequest) -> Dict:
+    """
+    Generate EditPlan from beats and constraints.
+    Returns structured EditPlan with primary_segments, overlays, trims, titles, audio_events.
+    
+    Args:
+        request: Contains narrative_structure, beats (list of beat objects with segment_ids),
+                 constraints (target_length, vibe, captions_on, music_on), optional style_profile_id
+    
+    Returns:
+        EditPlan as JSON dict with:
+        - primary_segments: List of segment operations (insert, trim)
+        - overlays: List of overlay operations
+        - trims: List of trim operations
+        - titles: List of title operations
+        - audio_events: List of audio operations
+    """
+    try:
+        # For v1, generate a simple EditPlan based on beats
+        # Each beat becomes a primary segment insertion
+        primary_segments = []
+        for beat in request.beats:
+            segment_ids = beat.get("segment_ids", [])
+            target_sec = beat.get("target_sec")
+            
+            for segment_id in segment_ids:
+                primary_segments.append({
+                    "operation": "insert",
+                    "segment_id": segment_id,
+                    "timeline_start_ticks": None,  # Will be computed by daemon based on accumulation
+                    "trim_in_offset_ticks": 0,  # No trim at start
+                    "trim_out_offset_ticks": 0,  # No trim at end
+                    "target_duration_sec": target_sec,
+                })
+        
+        # Generate basic EditPlan structure
+        edit_plan = {
+            "primary_segments": primary_segments,
+            "overlays": [],
+            "trims": [],
+            "titles": [],
+            "audio_events": [],
+        }
+        
+        # Add captions if requested
+        if request.constraints.get("captions_on", False):
+            # For each primary segment, add a caption overlay
+            for segment in primary_segments:
+                edit_plan["overlays"].append({
+                    "type": "caption",
+                    "segment_id": segment["segment_id"],
+                    "text": "",  # Will be filled from segment transcript
+                    "start_ticks": None,  # Aligned to segment
+                    "duration_ticks": None,  # Matches segment duration
+                })
+        
+        return edit_plan
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"EditPlan generation failed: {str(e)}")
 
 
 @app.post("/style/profile_from_references", response_model=StyleProfileResponse)

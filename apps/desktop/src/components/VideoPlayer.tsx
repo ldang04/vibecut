@@ -10,9 +10,10 @@ interface VideoPlayerProps {
   autoPlay?: boolean;
   isPlaying?: boolean; // External control of playback state
   onPlayPause?: (isPlaying: boolean) => void; // Callback when play/pause is toggled
+  timelineHoverTime?: number; // Timeline hover time - seek video to show this frame when not playing
 }
 
-export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, onHoverTime, autoPlay, isPlaying: externalIsPlaying, onPlayPause }: VideoPlayerProps) {
+export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, onHoverTime, autoPlay, isPlaying: externalIsPlaying, onPlayPause, timelineHoverTime }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -23,6 +24,42 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
   // Track the last src and startTime to detect changes
   const lastSrcRef = useRef<string>('');
   const lastStartTimeRef = useRef<number | undefined>(undefined);
+  const lastTimelineHoverTimeRef = useRef<number | undefined>(undefined);
+  
+  // Handle timeline hover time - seek to show frame when not playing
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !timelineHoverTime || externalIsPlaying) {
+      // Clear hover time ref when not hovering or when playing
+      if (!timelineHoverTime) {
+        lastTimelineHoverTimeRef.current = undefined;
+      }
+      return;
+    }
+
+    // Only update if hover time changed significantly (avoid constant seeking)
+    if (lastTimelineHoverTimeRef.current === undefined || 
+        Math.abs(timelineHoverTime - lastTimelineHoverTimeRef.current) > 0.05) {
+      lastTimelineHoverTimeRef.current = timelineHoverTime;
+      
+      // Seek to hover time if video is loaded
+      if (video.readyState >= 2) { // HAVE_CURRENT_DATA
+        video.currentTime = timelineHoverTime;
+      } else {
+        // Wait for video to load, then seek
+        const handleCanPlay = () => {
+          if (video && timelineHoverTime) {
+            video.currentTime = timelineHoverTime;
+          }
+          video.removeEventListener('canplay', handleCanPlay);
+        };
+        video.addEventListener('canplay', handleCanPlay);
+        return () => {
+          video.removeEventListener('canplay', handleCanPlay);
+        };
+      }
+    }
+  }, [timelineHoverTime, externalIsPlaying]);
   
   useEffect(() => {
     const video = videoRef.current;
@@ -34,25 +71,56 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
     
     if (srcChanged) {
       lastSrcRef.current = src;
+      lastTimelineHoverTimeRef.current = undefined; // Reset hover time when src changes
     }
     
     // Update video currentTime when startTime changes (playhead moved) or src changes
-    if (startTime !== undefined && (srcChanged || startTimeChanged)) {
+    // But only if not hovering (timelineHoverTime takes precedence when not playing)
+    if (startTime !== undefined && (srcChanged || startTimeChanged) && !timelineHoverTime) {
       lastStartTimeRef.current = startTime;
-      video.currentTime = startTime;
+      // When src changes, seek as soon as video data is available (loadeddata) for faster transitions
+      if (srcChanged) {
+        const handleLoadedData = () => {
+          if (video && startTime !== undefined) {
+            video.currentTime = startTime;
+          }
+          video.removeEventListener('loadeddata', handleLoadedData);
+        };
+        video.addEventListener('loadeddata', handleLoadedData);
+        // Also try immediately if video already has data (readyState >= 2 = HAVE_CURRENT_DATA)
+        if (video.readyState >= 2) {
+          video.currentTime = startTime;
+        }
+      } else {
+        video.currentTime = startTime;
+      }
     }
 
     // Sync with external playback state (Final Cut behavior - timeline controls video)
     // Only start playback if we're not already at the correct time
     if (externalIsPlaying !== undefined) {
       if (externalIsPlaying && video.paused) {
-        // Ensure video is at the correct startTime before playing
-        if (startTime !== undefined && Math.abs(video.currentTime - startTime) > 0.1) {
-          video.currentTime = startTime;
+        // Ensure video is fully ready and at the correct startTime before playing
+        const startPlayback = () => {
+          if (startTime !== undefined && Math.abs(video.currentTime - startTime) > 0.1) {
+            video.currentTime = startTime;
+          }
+          video.play().catch(() => {
+            // Auto-play may be blocked by browser, ignore error
+          });
+        };
+        
+        // Start playback as soon as video has current data (readyState >= 2 = HAVE_CURRENT_DATA)
+        // This is faster than waiting for canplaythrough, reducing black frames
+        if (video.readyState >= 2) {
+          startPlayback();
+        } else {
+          const handleLoadedData = () => {
+            startPlayback();
+            video.removeEventListener('loadeddata', handleLoadedData);
+          };
+          video.addEventListener('loadeddata', handleLoadedData);
         }
-        video.play().catch(() => {
-          // Auto-play may be blocked by browser, ignore error
-        });
       } else if (!externalIsPlaying && !video.paused) {
         video.pause();
       }
@@ -73,16 +141,20 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
         onTimeUpdate(current);
       }
       // Check if we've reached the end time
-      if (endTime !== undefined && current >= endTime) {
+      // Use a small threshold (0.01s) to detect end condition early for seamless transitions
+      if (endTime !== undefined && current >= endTime - 0.01) {
         // Clamp to endTime to prevent going past it
         if (video.currentTime > endTime) {
           video.currentTime = endTime;
         }
-        video.pause();
-        setIsPlaying(false);
-        // Don't reset currentTime here - let onEnded handle it
+        // Don't pause here - let the parent component handle the transition
+        // The parent will switch to the next clip before we hit the actual end
+        // Only pause if there's no onEnded handler (which means no next clip to transition to)
         if (onEnded) {
           onEnded();
+        } else {
+          video.pause();
+          setIsPlaying(false);
         }
       }
     };
@@ -105,7 +177,7 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
       video.removeEventListener('play', handlePlay);
       video.removeEventListener('pause', handlePause);
     };
-  }, [src, startTime, endTime, onTimeUpdate, onEnded, autoPlay, externalIsPlaying]);
+  }, [src, startTime, endTime, onTimeUpdate, onEnded, autoPlay, externalIsPlaying, timelineHoverTime]);
 
   const togglePlayPause = useCallback(() => {
     const video = videoRef.current;
@@ -199,6 +271,7 @@ export function VideoPlayer({ src, startTime, endTime, onTimeUpdate, onEnded, on
       <video
         ref={videoRef}
         src={src}
+        preload="auto"
         style={{ 
           width: '100%',
           height: '100%',

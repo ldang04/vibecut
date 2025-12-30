@@ -46,6 +46,14 @@ pub enum TimelineOperation {
         duration_ticks: i64,
         base_track_id: i64,
     },
+    ConvertPrimaryToOverlay {
+        clip_id: String,
+        position_ticks: i64,
+    },
+    ConvertOverlayToPrimary {
+        clip_id: String,
+        position_ticks: i64,
+    },
     ConsolidateTimeline,
     ClearTimeline,
 }
@@ -67,19 +75,52 @@ impl Timeline {
         }
     }
 
+    /// Find the first available overlay lane that has no clip overlapping with the insertion time range
+    /// Returns the track ID to use for the overlay clip
+    fn find_available_overlay_lane(
+        &self,
+        base_track_id: i64,
+        position_ticks: i64,
+        duration_ticks: i64,
+    ) -> i64 {
+        let insert_end_ticks = position_ticks + duration_ticks;
+        
+        // Check existing overlay tracks (id > base_track_id)
+        for track in self.tracks.iter().filter(|t| t.id > base_track_id) {
+            let has_overlap = track.clips.iter().any(|clip| {
+                let clip_end = clip.timeline_start_ticks + (clip.out_ticks - clip.in_ticks);
+                position_ticks < clip_end && insert_end_ticks > clip.timeline_start_ticks
+            });
+            
+            if !has_overlap {
+                return track.id; // Reuse this lane
+            }
+        }
+        
+        // No available lane, create new one
+        let max_id = self.tracks
+            .iter()
+            .filter(|t| t.id > base_track_id)
+            .map(|t| t.id)
+            .max()
+            .unwrap_or(base_track_id);
+        max_id + 1
+    }
+
     /// Consolidates all primary clips to track 1 and removes empty tracks
     /// This ensures the magnetic timeline model is maintained
+    /// NOTE: Overlay tracks (id > 1) are preserved - only clips that should be on primary are moved
     pub fn consolidate_timeline(&mut self) {
         // First, collect all clips from other video tracks that should be on primary track
+        // BUT: preserve overlay tracks (tracks with id > 1 that have clips) - these are intentional overlays
         let mut clips_to_move: Vec<ClipInstance> = Vec::new();
         
         // Collect clips from non-primary video tracks
-        for track in &mut self.tracks {
-            if track.id != 1 && track.kind == TrackKind::Video {
-                // Move all clips from this track to primary
-                clips_to_move.append(&mut track.clips);
-            }
-        }
+        // BUT: preserve overlay tracks (id > 1) - these are intentional overlays and should not be moved
+        // In the current implementation, overlay tracks are tracks with id > 1
+        // We should NOT move clips from overlay tracks back to primary
+        // For now, we preserve all overlay tracks by not collecting their clips
+        // This means clips_to_move will remain empty, preserving all overlay tracks
 
         // Find or create primary track (track 1) - do this after collecting clips
         let has_primary = self.tracks.iter().any(|t| t.id == 1);
@@ -93,6 +134,7 @@ impl Timeline {
         }
 
         // Now add all moved clips to primary track and update their track_id
+        // Note: clips_to_move should be empty since we're preserving overlay tracks
         if let Some(primary_track) = self.tracks.iter_mut().find(|t| t.id == 1) {
             // Update track_id for all clips being moved
             for clip in &mut clips_to_move {
@@ -101,10 +143,13 @@ impl Timeline {
             primary_track.clips.append(&mut clips_to_move);
         }
 
-        // Remove empty tracks (except primary track)
+        // Remove empty tracks (except primary track and overlay tracks)
+        // Overlay tracks (id > 1) should be preserved even if empty (they might be needed later)
+        // But for now, we'll remove empty overlay tracks to keep things clean
         self.tracks.retain(|t| t.id == 1 || !t.clips.is_empty());
 
         // Repack primary timeline to ensure contiguity
+        // This only affects track 1, preserving overlay tracks
         self.repack_primary_timeline();
     }
 
@@ -150,8 +195,13 @@ impl Timeline {
             } => {
                 for track in &mut self.tracks {
                     if let Some(clip) = track.clips.iter_mut().find(|c| c.id == clip_id) {
+                        // When extending left edge outward (in_ticks decreases), adjust timeline_start_ticks
+                        // to move the clip earlier on the timeline by the same amount
+                        let in_delta = new_in_ticks - clip.in_ticks;
                         clip.in_ticks = new_in_ticks;
                         clip.out_ticks = new_out_ticks;
+                        // Adjust timeline position when left edge changes (extending outward or trimming inward)
+                        clip.timeline_start_ticks += in_delta;
                         return Ok(());
                     }
                 }
@@ -554,22 +604,12 @@ impl Timeline {
                 duration_ticks,
                 base_track_id,
             } => {
-                // Find base track
-                let base_track = self.tracks.iter().find(|t| t.id == base_track_id);
-                
-                // Determine overlay track ID (base_track_id + 1, or find next available)
-                let overlay_track_id = if let Some(_) = base_track {
-                    // Find the highest track ID >= base_track_id + 1
-                    let max_overlay_id = self.tracks
-                        .iter()
-                        .filter(|t| t.id > base_track_id)
-                        .map(|t| t.id)
-                        .max()
-                        .unwrap_or(base_track_id);
-                    max_overlay_id + 1
-                } else {
-                    base_track_id + 1
-                };
+                // Use dynamic lane algorithm to find available overlay track
+                let overlay_track_id = self.find_available_overlay_lane(
+                    base_track_id,
+                    position_ticks,
+                    duration_ticks,
+                );
 
                 // Find or create overlay track
                 let overlay_track = if let Some(t) = self.tracks.iter_mut().find(|t| t.id == overlay_track_id) {
@@ -603,6 +643,152 @@ impl Timeline {
                 overlay_track.clips.insert(insert_index, new_clip);
 
                 Ok(())
+            }
+            TimelineOperation::ConvertPrimaryToOverlay {
+                clip_id,
+                position_ticks,
+            } => {
+                // Find the clip in primary track (track 1)
+                let mut clip_to_convert: Option<ClipInstance> = None;
+                let mut clip_original_position: Option<i64> = None;
+                
+                if let Some(primary_track) = self.tracks.iter_mut().find(|t| t.id == 1) {
+                    if let Some(clip_index) = primary_track.clips.iter().position(|c| c.id == clip_id) {
+                        let clip = &primary_track.clips[clip_index];
+                        clip_original_position = Some(clip.timeline_start_ticks);
+                        let duration = clip.out_ticks - clip.in_ticks;
+                        clip_to_convert = Some(primary_track.clips.remove(clip_index));
+                        
+                        // Collapse primary: shift all clips after removed clip left by duration
+                        for other_clip in &mut primary_track.clips {
+                            if let Some(original_pos) = clip_original_position {
+                                if other_clip.timeline_start_ticks > original_pos {
+                                    other_clip.timeline_start_ticks -= duration;
+                                }
+                            }
+                        }
+                        
+                        // Ensure contiguity
+                        self.repack_primary_timeline();
+                    }
+                }
+                
+                if let Some(mut clip) = clip_to_convert {
+                    let duration = clip.out_ticks - clip.in_ticks;
+                    
+                    // Use dynamic lane algorithm to find available overlay track
+                    let overlay_track_id = self.find_available_overlay_lane(
+                        1, // base_track_id is primary track (1)
+                        position_ticks,
+                        duration,
+                    );
+                    
+                    // Find or create overlay track
+                    let overlay_track = if let Some(t) = self.tracks.iter_mut().find(|t| t.id == overlay_track_id) {
+                        t
+                    } else {
+                        let new_track = Track {
+                            id: overlay_track_id,
+                            kind: TrackKind::Video,
+                            clips: Vec::new(),
+                        };
+                        self.tracks.push(new_track);
+                        self.tracks.last_mut().unwrap()
+                    };
+                    
+                    // Update clip position and track_id
+                    clip.timeline_start_ticks = position_ticks;
+                    clip.track_id = overlay_track.id;
+                    
+                    // Insert in sorted order
+                    let insert_index = overlay_track.clips
+                        .iter()
+                        .position(|c| c.timeline_start_ticks > position_ticks)
+                        .unwrap_or(overlay_track.clips.len());
+                    overlay_track.clips.insert(insert_index, clip);
+                    
+                    Ok(())
+                } else {
+                    Err("Clip not found in primary track".to_string())
+                }
+            }
+            TimelineOperation::ConvertOverlayToPrimary {
+                clip_id,
+                position_ticks,
+            } => {
+                // Find the clip in an overlay track (track id > 1)
+                let mut clip_to_convert: Option<ClipInstance> = None;
+                let mut source_track_id: Option<i64> = None;
+                
+                // Find clip in any overlay track (id > 1)
+                for track in &mut self.tracks {
+                    if track.id > 1 && track.kind == TrackKind::Video {
+                        if let Some(clip_index) = track.clips.iter().position(|c| c.id == clip_id) {
+                            source_track_id = Some(track.id);
+                            clip_to_convert = Some(track.clips.remove(clip_index));
+                            break;
+                        }
+                    }
+                }
+                
+                if let Some(mut clip) = clip_to_convert {
+                    let duration = clip.out_ticks - clip.in_ticks;
+                    
+                    // Find or create primary track (track 1)
+                    let primary_track = if let Some(t) = self.tracks.iter_mut().find(|t| t.id == 1) {
+                        t
+                    } else {
+                        let new_track = Track {
+                            id: 1,
+                            kind: TrackKind::Video,
+                            clips: Vec::new(),
+                        };
+                        self.tracks.push(new_track);
+                        self.tracks.last_mut().unwrap()
+                    };
+                    
+                    // Clamp new position to valid bounds (0 to end of timeline)
+                    let timeline_end = primary_track.clips.iter()
+                        .map(|c| c.timeline_start_ticks + (c.out_ticks - c.in_ticks))
+                        .max()
+                        .unwrap_or(0);
+                    
+                    let clamped_position = position_ticks.max(0).min(timeline_end);
+                    
+                    // Shift clips at/after insertion point right by clip duration (ripple effect)
+                    for other_clip in &mut primary_track.clips {
+                        if other_clip.timeline_start_ticks >= clamped_position {
+                            other_clip.timeline_start_ticks += duration;
+                        }
+                    }
+                    
+                    // Update clip's position and track_id
+                    clip.timeline_start_ticks = clamped_position;
+                    clip.track_id = 1;
+                    
+                    // Insert clip in sorted order
+                    let insert_index = primary_track.clips
+                        .iter()
+                        .position(|c| c.timeline_start_ticks > clamped_position)
+                        .unwrap_or(primary_track.clips.len());
+                    primary_track.clips.insert(insert_index, clip);
+                    
+                    // Ensure contiguity
+                    self.repack_primary_timeline();
+                    
+                    // Remove empty overlay track if it exists and is now empty
+                    if let Some(track_id) = source_track_id {
+                        if let Some(track) = self.tracks.iter().find(|t| t.id == track_id) {
+                            if track.clips.is_empty() {
+                                self.tracks.retain(|t| t.id != track_id);
+                            }
+                        }
+                    }
+                    
+                    Ok(())
+                } else {
+                    Err("Clip not found in overlay track".to_string())
+                }
             }
             TimelineOperation::ConsolidateTimeline => {
                 self.consolidate_timeline();

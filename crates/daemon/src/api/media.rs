@@ -51,11 +51,19 @@ pub struct MediaAssetResponse {
     height: i32,
 }
 
+#[derive(Serialize)]
+pub struct AudioAssetResponse {
+    id: i64,
+    path: String,
+    duration_ticks: i64,
+}
+
 pub fn router(db: Arc<Database>, job_manager: Arc<JobManager>) -> Router {
     Router::new()
         .route("/:id/import_raw", post(import_raw))
         .route("/:id/media", get(list_media))
         .route("/:id/references", get(list_references))
+        .route("/:id/audio", get(list_audio))
         .route("/:id/media/:asset_id", delete(delete_media_asset))
         .route("/:id/media/:asset_id/proxy", get(get_proxy_file))
         .route("/:id/media/:asset_id/thumbnail/:timestamp_ms", get(get_thumbnail))
@@ -108,6 +116,16 @@ async fn list_references(
         .collect();
     
     Ok(Json(response))
+}
+
+async fn list_audio(
+    State((db, _job_manager)): State<(Arc<Database>, Arc<JobManager>)>,
+    Path(project_id): Path<i64>,
+) -> Result<Json<Vec<AudioAssetResponse>>, StatusCode> {
+    // Get audio-only assets for this specific project (has_audio = true, width = 0, height = 0)
+    // For now, return empty array as audio assets are not separately stored
+    // This endpoint exists to prevent 404 errors
+    Ok(Json(vec![]))
 }
 
 async fn delete_media_asset(
@@ -591,19 +609,25 @@ async fn process_single_video(
     });
     let _proxy_job_id = job_manager.create_job(JobType::GenerateProxy, Some(proxy_job_payload))?;
 
-    // Queue transcription job
-    let transcribe_job_payload = json!({
-        "media_asset_id": asset_id,
-        "media_path": video_path.to_str().unwrap(),
+    // Queue BuildSegments job (can run immediately)
+    let build_segments_payload = json!({
+        "asset_id": asset_id,
     });
-    let _transcribe_job_id = job_manager.create_job(JobType::Transcribe, Some(transcribe_job_payload))?;
+    let _build_segments_id = job_manager.create_job(JobType::BuildSegments, Some(build_segments_payload))?;
 
-    // Queue vision analysis job
-    let vision_job_payload = json!({
-        "media_asset_id": asset_id,
+    // Queue transcription job (runs in parallel)
+    let transcribe_job_payload = json!({
+        "asset_id": asset_id,
         "media_path": video_path.to_str().unwrap(),
     });
-    let _vision_job_id = job_manager.create_job(JobType::AnalyzeVision, Some(vision_job_payload))?;
+    let _transcribe_job_id = job_manager.create_job(JobType::TranscribeAsset, Some(transcribe_job_payload))?;
+
+    // Queue vision analysis job (runs in parallel)
+    let vision_job_payload = json!({
+        "asset_id": asset_id,
+        "media_path": video_path.to_str().unwrap(),
+    });
+    let _vision_job_id = job_manager.create_job(JobType::AnalyzeVisionAsset, Some(vision_job_payload))?;
 
     // Update progress
     let progress = (idx + 1) as f64 / total_files as f64;

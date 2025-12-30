@@ -21,15 +21,32 @@ interface MediaAsset {
   height: number;
 }
 
+interface TextTemplate {
+  id: string;
+  name: 'Title' | 'Subtitle';
+  defaultText: string;
+  style: {
+    fontSize: number;
+    alignment: 'center' | 'bottom';
+    position: 'center' | 'bottom';
+  };
+}
+
+interface AudioAsset {
+  id: number;
+  path: string;
+  duration_ticks: number;
+}
+
 interface MediaLibraryProps {
-  mode: 'raw' | 'references';
+  mode: 'raw' | 'references' | 'text' | 'audio';
   onClipSelect: (clip: any) => void;
   onImportComplete?: () => void;
   onJobUpdate?: (job: JobResponse) => void;
   projectId?: number;
-  onDragStart?: (asset: MediaAsset, event: React.MouseEvent) => void;
+  onDragStart?: (asset: MediaAsset | TextTemplate | AudioAsset, event: React.MouseEvent) => void;
   onDragEnd?: () => void;
-  externalDragAsset?: MediaAsset | null; // Added: external drag state from parent
+  externalDragAsset?: MediaAsset | TextTemplate | AudioAsset | null; // Added: external drag state from parent
 }
 
 // Helper to safely access electron API
@@ -178,6 +195,30 @@ function ThumbnailVideo({ assetId, projectId, duration, formatDuration }: { asse
   );
 }
 
+// Text templates - default text clips
+const TEXT_TEMPLATES: TextTemplate[] = [
+  {
+    id: 'title',
+    name: 'Title',
+    defaultText: 'Title',
+    style: {
+      fontSize: 48,
+      alignment: 'center',
+      position: 'center',
+    },
+  },
+  {
+    id: 'subtitle',
+    name: 'Subtitle',
+    defaultText: 'Subtitle',
+    style: {
+      fontSize: 32,
+      alignment: 'center',
+      position: 'bottom',
+    },
+  },
+];
+
 export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate, projectId = 1, onDragStart, onDragEnd, externalDragAsset }: MediaLibraryProps) {
   const [referenceAssets, setReferenceAssets] = useState<MediaAsset[]>([]); // Store reference assets separately
   const [referenceJobs, setReferenceJobs] = useState<Map<number, JobResponse>>(new Map());
@@ -185,13 +226,21 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
   const [allJobIds, setAllJobIds] = useState<number[]>([]);
   const [activeJobs, setActiveJobs] = useState<Map<number, JobResponse>>(new Map());
   const [mediaAssets, setMediaAssets] = useState<MediaAsset[]>([]);
+  const [audioAssets, setAudioAssets] = useState<AudioAsset[]>([]);
+  const [audioJobs, setAudioJobs] = useState<Map<number, JobResponse>>(new Map());
+  const [dragTemplate, setDragTemplate] = useState<TextTemplate | null>(null);
+  const [dragAudioAsset, setDragAudioAsset] = useState<AudioAsset | null>(null);
   const activeJobsRef = useRef<Map<number, JobResponse>>(new Map());
   const referenceJobsRef = useRef<Map<number, JobResponse>>(new Map());
+  const audioJobsRef = useRef<Map<number, JobResponse>>(new Map());
   const importRaw = useDaemon<ImportRawResponse>(`/projects/${projectId}/import_raw`, { method: 'POST' });
   const importReference = useDaemon<ImportRawResponse>(`/projects/${projectId}/import_reference`, { method: 'POST' });
+  const importAudio = useDaemon<ImportRawResponse>(`/projects/${projectId}/import_audio`, { method: 'POST' });
   const mediaAssetsData = useDaemon<MediaAsset[]>(`/projects/${projectId}/media`, { method: 'GET' });
   const referenceAssetsData = useDaemon<MediaAsset[]>(`/projects/${projectId}/references`, { method: 'GET' });
+  const audioAssetsData = useDaemon<AudioAsset[]>(`/projects/${projectId}/audio`, { method: 'GET' });
   const [hoveredAssetId, setHoveredAssetId] = useState<number | null>(null);
+  const [hoveredTemplateId, setHoveredTemplateId] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragAsset, setDragAsset] = useState<MediaAsset | null>(null);
   const [dragPosition, setDragPosition] = useState<{ x: number; y: number } | null>(null);
@@ -209,6 +258,10 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
   useEffect(() => {
     referenceJobsRef.current = referenceJobs;
   }, [referenceJobs]);
+
+  useEffect(() => {
+    audioJobsRef.current = audioJobs;
+  }, [audioJobs]);
   
 
   // Fetch media assets and clear state when projectId changes
@@ -216,10 +269,12 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
     // Always clear existing media assets immediately when switching projects
     setMediaAssets([]);
     setReferenceAssets([]);
+    setAudioAssets([]);
     setCurrentJobId(null);
     setAllJobIds([]);
     setActiveJobs(new Map());
     setReferenceJobs(new Map());
+    setAudioJobs(new Map());
     
     if (projectId) {
       // Use setTimeout to ensure state is cleared before fetching
@@ -227,6 +282,7 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
       const timeoutId = setTimeout(() => {
         mediaAssetsData.execute();
         referenceAssetsData.execute();
+        audioAssetsData.execute();
       }, 10);
       return () => clearTimeout(timeoutId);
     }
@@ -262,6 +318,17 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
       setReferenceAssets([]);
     }
   }, [referenceAssetsData.data, referenceAssetsData.loading]);
+
+  // Update audio assets when data changes
+  useEffect(() => {
+    if (audioAssetsData.data && Array.isArray(audioAssetsData.data)) {
+      setAudioAssets(audioAssetsData.data);
+    } else if (audioAssetsData.data === null && !audioAssetsData.loading) {
+      setAudioAssets([]);
+    } else if (!audioAssetsData.loading && !audioAssetsData.data) {
+      setAudioAssets([]);
+    }
+  }, [audioAssetsData.data, audioAssetsData.loading]);
 
   const handleSelectReferenceFiles = async () => {
     const dialog = getElectronDialog();
@@ -322,7 +389,7 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
             const jobId = result.job_id;
             setAllJobIds([jobId]);
             setCurrentJobId(jobId);
-            const job = { id: jobId, status: 'Pending', progress: 0 };
+            const job = { id: jobId, status: 'Pending', progress: 0, job_type: undefined };
             setReferenceJobs(new Map([[jobId, job]]));
             if (onJobUpdate) {
               onJobUpdate(job);
@@ -470,13 +537,15 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
       
       if (isCompleted) {
         console.log('Job completed:', completedJobId, 'Status:', jobData.status);
-        // Check if this is a reference job BEFORE removing it from the map
+        // Check if this is a reference job or audio job BEFORE removing it from the map
         const isReferenceJob = referenceJobsRef.current.has(completedJobId);
+        const isAudioJob = audioJobsRef.current.has(completedJobId);
         
         // Compute remaining jobs BEFORE updating state (using refs for current state)
         const currentActiveJobs = activeJobsRef.current;
         const currentReferenceJobs = referenceJobsRef.current;
-        const allJobsMap = new Map([...currentActiveJobs, ...currentReferenceJobs]);
+        const currentAudioJobs = audioJobsRef.current;
+        const allJobsMap = new Map([...currentActiveJobs, ...currentReferenceJobs, ...currentAudioJobs]);
         const remainingJobs = allJobIds.filter(jobId => {
           if (jobId === completedJobId) {
             return false; // This job just completed
@@ -492,9 +561,15 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
         
         console.log('Remaining jobs:', remainingJobs.length, 'All job IDs:', allJobIds.length);
         
-        // Remove completed job from appropriate map (activeJobs or referenceJobs)
+        // Remove completed job from appropriate map (activeJobs, referenceJobs, or audioJobs)
         if (isReferenceJob) {
           setReferenceJobs((prev) => {
+            const updated = new Map(prev);
+            updated.delete(completedJobId);
+            return updated;
+          });
+        } else if (isAudioJob) {
+          setAudioJobs((prev) => {
             const updated = new Map(prev);
             updated.delete(completedJobId);
             return updated;
@@ -538,6 +613,14 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
                     console.log(`Updating referenceAssets with ${result.length} assets`);
                     setReferenceAssets([...result]);
                   }
+                } else if (isAudioJob) {
+                  console.log('Refreshing audio assets after upload completion...');
+                  const result = await audioAssetsData.execute();
+                  console.log('Audio assets refresh result:', result);
+                  if (result && Array.isArray(result)) {
+                    console.log(`Updating audioAssets with ${result.length} assets`);
+                    setAudioAssets([...result]);
+                  }
                 } else {
                   console.log('Refreshing media assets after upload completion...');
                   const result = await mediaAssetsData.execute();
@@ -572,14 +655,22 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
           }
         }
       } else {
-        // Update job status in activeJobs or referenceJobs depending on which map contains the job
+        // Update job status in activeJobs, referenceJobs, or audioJobs depending on which map contains the job
         const isReferenceJob = referenceJobsRef.current.has(completedJobId);
-        console.log('Updating job status. Job ID:', completedJobId, 'Is reference job:', isReferenceJob, 'Status:', status);
+        const isAudioJob = audioJobsRef.current.has(completedJobId);
+        console.log('Updating job status. Job ID:', completedJobId, 'Is reference job:', isReferenceJob, 'Is audio job:', isAudioJob, 'Status:', status);
         if (isReferenceJob) {
           setReferenceJobs((prev) => {
             const updated = new Map(prev);
             updated.set(completedJobId, jobData);
             console.log('Updated referenceJobs map with job:', completedJobId, 'Status:', jobData.status);
+            return updated;
+          });
+        } else if (isAudioJob) {
+          setAudioJobs((prev) => {
+            const updated = new Map(prev);
+            updated.set(completedJobId, jobData);
+            console.log('Updated audioJobs map with job:', completedJobId, 'Status:', jobData.status);
             return updated;
           });
         } else {
@@ -592,7 +683,10 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
         }
       }
       
+      // Always call onJobUpdate with the full job data (which includes job_type)
+      // This ensures analysis jobs are properly tracked even if they weren't initially created with job_type
       if (onJobUpdate) {
+        console.log('[MediaLibrary] Calling onJobUpdate with job data:', jobData);
         onJobUpdate(jobData);
       }
     }
@@ -620,11 +714,22 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
     }
   );
 
+  const activeAudioJobsArray = Array.from(audioJobs.values()).filter(
+    job => {
+      const jobStatus = typeof job.status === 'string' && job.status.startsWith('"') 
+        ? JSON.parse(job.status) 
+        : job.status;
+      return jobStatus === 'Pending' || jobStatus === 'Running';
+    }
+  );
+
   const hasRawFootage = mediaAssets.length > 0 || activeJobsArray.length > 0;
   const hasReferenceFootage = referenceAssets.length > 0 || activeReferenceJobsArray.length > 0;
-  const hasFootage = mode === 'raw' ? hasRawFootage : hasReferenceFootage;
+  const hasAudioFiles = audioAssets.length > 0 || activeAudioJobsArray.length > 0;
+  const hasFootage = mode === 'raw' ? hasRawFootage : mode === 'references' ? hasReferenceFootage : mode === 'audio' ? hasAudioFiles : mode === 'text' ? true : false;
   const displayAssets = mode === 'raw' ? mediaAssets : [];
   const displayReferenceAssets = mode === 'references' ? referenceAssets : []; // Display reference assets (with thumbnails)
+  const displayAudioAssets = mode === 'audio' ? audioAssets : [];
 
   const formatDuration = (ticks: number): string => {
     const seconds = Math.floor(ticks / 48000);
@@ -670,17 +775,94 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
     }
   };
 
-  const handleImport = mode === 'raw' ? handleImportRaw : handleSelectReferenceFiles;
+  const handleImportAudio = async () => {
+    const dialog = getElectronDialog();
+    if (!dialog) {
+      alert('File picker not available. Make sure you are running in Electron.');
+      return;
+    }
+
+    try {
+      const filePaths = await dialog.openFiles({
+        multiSelect: true,
+        title: 'Select Audio Files',
+        filters: [
+          {
+            name: 'Audio Files',
+            extensions: ['mp3', 'wav', 'aac', 'm4a', 'flac', 'ogg', 'wma', 'aiff'],
+          },
+          { name: 'All Files', extensions: ['*'] },
+        ],
+      });
+
+      if (filePaths && filePaths.length > 0) {
+        console.log('Uploading audio files:', filePaths);
+        const result = await importAudio.execute({ file_paths: filePaths });
+        if (result && result.job_id) {
+          console.log('Audio upload initiated, job IDs:', result.job_ids || [result.job_id]);
+          if (result.job_ids && result.job_ids.length > 1) {
+            setAllJobIds(result.job_ids);
+            const initialJobs = new Map<number, JobResponse>();
+            result.job_ids.forEach(jobId => {
+              const job = { id: jobId, status: 'Pending', progress: 0 };
+              initialJobs.set(jobId, job);
+              if (onJobUpdate) {
+                onJobUpdate(job);
+              }
+            });
+            setAudioJobs(initialJobs);
+            setCurrentJobId(result.job_ids[0]);
+            const fileCount = result.job_ids.length;
+            setTimeout(() => {
+              console.log('Fallback: Refreshing audio assets after upload (fallback timer)');
+              audioAssetsData.execute().then(result => {
+                if (result && Array.isArray(result)) {
+                  setAudioAssets([...result]);
+                }
+              });
+            }, 3000 * fileCount);
+          } else {
+            const jobId = result.job_id;
+            setAllJobIds([jobId]);
+            setCurrentJobId(jobId);
+            const job = { id: jobId, status: 'Pending', progress: 0 };
+            setAudioJobs(new Map([[jobId, job]]));
+            if (onJobUpdate) {
+              onJobUpdate(job);
+            }
+            setTimeout(() => {
+              console.log('Fallback: Refreshing audio assets after upload (fallback timer)');
+              audioAssetsData.execute().then(result => {
+                if (result && Array.isArray(result)) {
+                  setAudioAssets([...result]);
+                }
+              });
+            }, 3000);
+          }
+          jobStatus.execute();
+        } else if (importAudio.error) {
+          console.error('Audio upload failed:', importAudio.error);
+        }
+      }
+    } catch (error) {
+      console.error('Error opening file picker:', error);
+      alert('Failed to open file picker. Please check the console for details.');
+    }
+  };
+
+  const handleImport = mode === 'raw' ? handleImportRaw : mode === 'references' ? handleSelectReferenceFiles : mode === 'audio' ? handleImportAudio : undefined;
 
   // Clear drag state when external drag asset is cleared (drop happened)
   // Use a small delay to ensure the drop is processed first
   useEffect(() => {
-    if (!externalDragAsset && (isDragging || dragAsset)) {
+    if (!externalDragAsset && (isDragging || dragAsset || dragTemplate || dragAudioAsset)) {
       // External drag was cleared, so clear our local drag state
       // Use setTimeout to ensure drop is processed first
       const timeoutId = setTimeout(() => {
         setIsDragging(false);
         setDragAsset(null);
+        setDragTemplate(null);
+        setDragAudioAsset(null);
         setDragPosition(null);
         // Reset cursor
         document.body.style.cursor = '';
@@ -688,7 +870,7 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
       
       return () => clearTimeout(timeoutId);
     }
-  }, [externalDragAsset, isDragging, dragAsset]);
+  }, [externalDragAsset, isDragging, dragAsset, dragTemplate, dragAudioAsset]);
 
   // Handle global mouse events for drag
   useEffect(() => {
@@ -699,6 +881,8 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
         setTimeout(() => {
           setIsDragging(false);
           setDragAsset(null);
+          setDragTemplate(null);
+          setDragAudioAsset(null);
           setDragPosition(null);
           if (onDragEnd) {
             onDragEnd();
@@ -741,28 +925,31 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
     >
       {/* Content Area */}
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', flex: 1, overflow: 'hidden' }}>
-        {/* Import Button - always visible, large when no footage */}
-        <div style={{ padding: hasFootage ? '1rem 1rem 0.75rem 1rem' : '2rem 1rem', flexShrink: 0 }}>
-          <button
-            onClick={handleImport}
-            disabled={(importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references')}
-            style={{
-              width: '100%',
-              padding: hasFootage ? '0.5rem' : '1rem',
-              backgroundColor: ((importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references')) ? '#505050' : '#2a2a2a',
-              color: '#e5e5e5',
-              border: '1px solid #404040',
-              borderRadius: '4px',
-              fontSize: hasFootage ? '12px' : '14px',
-              fontWeight: hasFootage ? 400 : 500,
-              cursor: ((importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references')) ? 'not-allowed' : 'pointer',
-              transition: 'background-color 0.2s',
-              outline: 'none',
-            }}
-            onMouseDown={(e) => e.preventDefault()}
-          >
-            {((importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references')) ? 'Importing...' : 'Import Video Clips'}
-          </button>
+        {/* Import Button - always visible, large when no footage (only for raw, references, audio) */}
+        {(mode === 'raw' || mode === 'references' || mode === 'audio') && (
+          <div style={{ padding: hasFootage ? '1rem 1rem 0.75rem 1rem' : '2rem 1rem', flexShrink: 0 }}>
+            <button
+              onClick={handleImport}
+              disabled={(importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references') || (importAudio.loading && mode === 'audio')}
+              style={{
+                width: '100%',
+                padding: hasFootage ? '0.5rem' : '1rem',
+                backgroundColor: ((importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references') || (importAudio.loading && mode === 'audio')) ? '#505050' : '#2a2a2a',
+                color: '#e5e5e5',
+                border: '1px solid #404040',
+                borderRadius: '4px',
+                fontSize: hasFootage ? '12px' : '14px',
+                fontWeight: hasFootage ? 400 : 500,
+                cursor: ((importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references') || (importAudio.loading && mode === 'audio')) ? 'not-allowed' : 'pointer',
+                transition: 'background-color 0.2s',
+                outline: 'none',
+              }}
+              onMouseDown={(e) => e.preventDefault()}
+            >
+              {((importRaw.loading && mode === 'raw') || (importReference.loading && mode === 'references')) ? 'Importing...' : 
+               (importAudio.loading && mode === 'audio') ? 'Importing...' :
+               mode === 'audio' ? 'Import Audio Files' : 'Import Video Clips'}
+            </button>
 
           {importRaw.error && mode === 'raw' && (
             <div style={{ marginTop: '0.5rem', color: '#ef4444', fontSize: '12px' }}>
@@ -791,7 +978,19 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
             </div>
           )}
 
+          {importAudio.error && mode === 'audio' && (
+            <div style={{ marginTop: '0.5rem', color: '#ef4444', fontSize: '12px' }}>
+              Error: {importAudio.error.message}
+              {importAudio.error.message.includes('Failed to fetch') && (
+                <div style={{ marginTop: '0.25rem', fontSize: '11px', color: '#a0a0a0' }}>
+                  Make sure the daemon server is running on port 7777
+                </div>
+              )}
+            </div>
+          )}
+
         </div>
+        )}
 
         {/* Scrollable media assets grid */}
         {hasFootage && (
@@ -994,56 +1193,283 @@ export function MediaLibrary({ mode, onClipSelect, onImportComplete, onJobUpdate
                   </div>
                 ))}
               </div>
+            ) : mode === 'text' ? (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                {TEXT_TEMPLATES.map((template) => (
+                  <div
+                    key={template.id}
+                    onClick={() => {
+                      if (!isDragging && !dragTemplate) {
+                        onClipSelect(template);
+                      }
+                    }}
+                    onMouseDown={(e) => {
+                      if (e.button === 0) {
+                        e.preventDefault();
+                        setIsDragging(true);
+                        setDragTemplate(template);
+                        if (onDragStart) {
+                          onDragStart(template, e);
+                        }
+                      }
+                    }}
+                    onMouseEnter={() => {}}
+                    onMouseLeave={() => {}}
+                    style={{
+                      borderRadius: '8px',
+                      overflow: 'hidden',
+                      backgroundColor: '#1e1e1e',
+                      border: '1px solid #a855f7',
+                      cursor: isDragging && dragTemplate?.id === template.id ? 'grabbing' : 'grab',
+                      transition: 'border-color 0.2s',
+                      outline: 'none',
+                      position: 'relative',
+                      userSelect: 'none',
+                    }}
+                  >
+                    {/* Thumbnail area - similar to video thumbnails */}
+                    <div
+                      style={{
+                        width: '100%',
+                        aspectRatio: '16/9',
+                        backgroundColor: '#252525',
+                        display: 'flex',
+                        alignItems: template.style.position === 'center' ? 'center' : 'flex-end',
+                        justifyContent: 'center',
+                        padding: '1rem',
+                        position: 'relative',
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: `${Math.min(template.style.fontSize, 24)}px`,
+                          color: '#e5e5e5',
+                          fontWeight: 600,
+                          textAlign: 'center',
+                          pointerEvents: 'none',
+                        }}
+                      >
+                        {template.defaultText}
+                      </div>
+                    </div>
+                    {/* Text info area - matches video thumbnail style */}
+                    <div style={{ padding: '0.5rem' }}>
+                      <div
+                        style={{
+                          fontSize: '11px',
+                          color: '#e5e5e5',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                        title={template.name}
+                      >
+                        {template.name}
+                      </div>
+                      <div style={{ fontSize: '10px', color: '#a0a0a0', marginTop: '2px' }}>
+                        Text
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : mode === 'audio' && displayAudioAssets.length > 0 ? (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                {displayAudioAssets.map((asset) => (
+                  <div
+                    key={asset.id}
+                    onClick={() => {
+                      if (!isDragging && !dragAudioAsset) {
+                        onClipSelect(asset);
+                      }
+                    }}
+                    onMouseDown={(e) => {
+                      if (e.button === 0) {
+                        e.preventDefault();
+                        setIsDragging(true);
+                        setDragAudioAsset(asset);
+                        if (onDragStart) {
+                          onDragStart(asset, e);
+                        }
+                      }
+                    }}
+                    onMouseEnter={() => setHoveredAssetId(asset.id)}
+                    onMouseLeave={() => setHoveredAssetId(null)}
+                    style={{
+                      borderRadius: '8px',
+                      overflow: 'hidden',
+                      backgroundColor: '#1e1e1e',
+                      border: '1px solid #404040',
+                      cursor: isDragging && dragAudioAsset?.id === asset.id ? 'grabbing' : 'grab',
+                      transition: 'border-color 0.2s',
+                      outline: 'none',
+                      position: 'relative',
+                      userSelect: 'none',
+                    }}
+                  >
+                    {/* Audio waveform placeholder - matches video thumbnail aspect ratio */}
+                    <div
+                      style={{
+                        width: '100%',
+                        aspectRatio: '16/9',
+                        backgroundColor: '#252525',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: '32px',
+                        color: '#10b981',
+                      }}
+                    >
+                      🎵
+                    </div>
+                    {/* Text info area - matches video thumbnail style */}
+                    <div style={{ padding: '0.5rem' }}>
+                      <div
+                        style={{
+                          fontSize: '11px',
+                          color: '#e5e5e5',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                        title={getFileName(asset.path)}
+                      >
+                        {getFileName(asset.path)}
+                      </div>
+                      <div style={{ fontSize: '10px', color: '#a0a0a0', marginTop: '2px' }}>
+                        {formatDuration(asset.duration_ticks)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             ) : null}
           </div>
         )}
       </div>
 
       {/* Drag Preview - follows cursor */}
-      {isDragging && dragAsset && dragPosition && (
-        <div
-          style={{
-            position: 'fixed',
-            left: dragPosition.x - 80,
-            top: dragPosition.y - 60,
-            width: '160px',
-            height: '90px',
-            backgroundColor: '#1e1e1e',
-            border: '2px solid #3b82f6',
-            borderRadius: '8px',
-            pointerEvents: 'none',
-            zIndex: 10000,
-            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
-            opacity: 0.9,
-            transform: 'scale(0.8)',
-          }}
-        >
-          <div
-            style={{
-              width: '100%',
-              height: '100%',
-              borderRadius: '6px',
-              overflow: 'hidden',
-              backgroundColor: '#2a2a2a',
-            }}
-          >
-            <video
-              src={`http://127.0.0.1:7777/api/projects/${projectId}/media/${dragAsset.id}/proxy`}
+      {isDragging && dragPosition && (
+        <>
+          {dragAsset && (
+            <div
               style={{
-                width: '100%',
-                height: '100%',
-                objectFit: 'cover',
+                position: 'fixed',
+                left: dragPosition.x - 80,
+                top: dragPosition.y - 60,
+                width: '160px',
+                height: '90px',
+                backgroundColor: '#1e1e1e',
+                border: '2px solid #3b82f6',
+                borderRadius: '8px',
+                pointerEvents: 'none',
+                zIndex: 10000,
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
+                opacity: 0.9,
+                transform: 'scale(0.8)',
               }}
-              muted
-              playsInline
-              preload="metadata"
-              onLoadedMetadata={(e) => {
-                const video = e.target as HTMLVideoElement;
-                video.currentTime = 0.1;
+            >
+              <div
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  borderRadius: '6px',
+                  overflow: 'hidden',
+                  backgroundColor: '#2a2a2a',
+                }}
+              >
+                <video
+                  src={`http://127.0.0.1:7777/api/projects/${projectId}/media/${dragAsset.id}/proxy`}
+                  style={{
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'cover',
+                  }}
+                  muted
+                  playsInline
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const video = e.target as HTMLVideoElement;
+                    video.currentTime = 0.1;
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          {dragTemplate && (
+            <div
+              style={{
+                position: 'fixed',
+                left: dragPosition.x - 80,
+                top: dragPosition.y - 60,
+                width: '160px',
+                height: '90px',
+                backgroundColor: '#1e1e1e',
+                border: '2px solid #a855f7',
+                borderRadius: '8px',
+                pointerEvents: 'none',
+                zIndex: 10000,
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
+                opacity: 0.9,
+                transform: 'scale(0.8)',
+                display: 'flex',
+                alignItems: dragTemplate.style.position === 'center' ? 'center' : 'flex-end',
+                justifyContent: 'center',
+                padding: '0.5rem',
               }}
-            />
-          </div>
-        </div>
+            >
+              <div
+                style={{
+                  fontSize: `${Math.min(dragTemplate.style.fontSize, 24)}px`,
+                  color: '#e5e5e5',
+                  fontWeight: 600,
+                  textAlign: 'center',
+                }}
+              >
+                {dragTemplate.defaultText}
+              </div>
+            </div>
+          )}
+          {dragAudioAsset && (
+            <div
+              style={{
+                position: 'fixed',
+                left: dragPosition.x - 80,
+                top: dragPosition.y - 60,
+                width: '160px',
+                height: '90px',
+                backgroundColor: '#1e1e1e',
+                border: '2px solid #10b981',
+                borderRadius: '8px',
+                pointerEvents: 'none',
+                zIndex: 10000,
+                boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)',
+                opacity: 0.9,
+                transform: 'scale(0.8)',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '0.5rem',
+              }}
+            >
+              <div style={{ fontSize: '32px', color: '#10b981', marginBottom: '0.25rem' }}>🎵</div>
+              <div
+                style={{
+                  fontSize: '10px',
+                  color: '#e5e5e5',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  width: '100%',
+                  textAlign: 'center',
+                }}
+              >
+                {getFileName(dragAudioAsset.path)}
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

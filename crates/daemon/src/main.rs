@@ -7,7 +7,9 @@ use tower_http::cors::{CorsLayer, Any};
 
 mod api;
 mod db;
+mod embeddings;
 mod jobs;
+mod llm;
 mod media;
 mod planner;
 
@@ -42,6 +44,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize job manager
     let job_manager = Arc::new(jobs::JobManager::new(db.clone()));
+
+    // Initialize and spawn job processor
+    let job_processor = jobs::processor::JobProcessor::new(db.clone(), job_manager.clone());
+    let _processor_handle = tokio::spawn(async move {
+        job_processor.run().await;
+    });
 
     // Build the router with CORS support
     let cors = CorsLayer::new()

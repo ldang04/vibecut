@@ -10,9 +10,10 @@ interface ViewerProps {
   onEnded?: () => void;
   isPlaying?: boolean;
   onPlayPause?: (isPlaying: boolean) => void;
+  timelineHoverTime?: number; // Timeline hover time in seconds - shows frame at this position
 }
 
-export function Viewer({ videoSrc, startTime, endTime, currentTime, onTimeUpdate, onEnded, isPlaying, onPlayPause }: ViewerProps) {
+export function Viewer({ videoSrc, startTime, endTime, currentTime, onTimeUpdate, onEnded, isPlaying, onPlayPause, timelineHoverTime }: ViewerProps) {
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const formatTimecode = (seconds: number): string => {
     const mins = Math.floor(seconds / 60);
@@ -45,6 +46,7 @@ export function Viewer({ videoSrc, startTime, endTime, currentTime, onTimeUpdate
             autoPlay={isPlaying}
             isPlaying={isPlaying}
             onPlayPause={onPlayPause}
+            timelineHoverTime={timelineHoverTime}
           />
           {(currentTime !== undefined || hoverTime !== null) && (
             <div

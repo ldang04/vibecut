@@ -77,7 +77,6 @@ export function TimelineToolbar({
           title="Pointer Tool"
         >
           <span>↖</span>
-          <span>Pointer</span>
         </button>
         <button
           onClick={() => onToolChange('cut')}
@@ -97,7 +96,6 @@ export function TimelineToolbar({
           title="Cut Tool"
         >
           <span>✂</span>
-          <span>Cut</span>
         </button>
       </div>
     </div>

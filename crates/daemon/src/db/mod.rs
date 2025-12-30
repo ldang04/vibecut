@@ -124,6 +124,34 @@ impl Database {
             );
         }
 
+        // Migration: Add analysis state tracking columns to media_assets
+        let has_segments_built_at = conn
+            .prepare("SELECT segments_built_at FROM media_assets LIMIT 1")
+            .is_ok();
+        
+        if !has_segments_built_at {
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN segments_built_at TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN transcript_ready_at TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN vision_ready_at TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN metadata_ready_at TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN embeddings_ready_at TEXT",
+                [],
+            );
+        }
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proxies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,37 +169,168 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS segments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 media_asset_id INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
                 start_ticks INTEGER NOT NULL,
                 end_ticks INTEGER NOT NULL,
+                src_in_ticks INTEGER,
+                src_out_ticks INTEGER,
+                segment_kind TEXT,
+                summary_text TEXT,
+                keywords_json TEXT,
+                quality_json TEXT,
+                subject_json TEXT,
+                scene_json TEXT,
+                capture_time TEXT,
                 transcript TEXT,
                 speaker TEXT,
                 scores_json TEXT,
                 tags_json TEXT,
-                FOREIGN KEY (media_asset_id) REFERENCES media_assets(id)
+                FOREIGN KEY (media_asset_id) REFERENCES media_assets(id),
+                FOREIGN KEY (project_id) REFERENCES projects(id)
             )",
             [],
         )?;
+
+        // Migration: Add new segment columns if they don't exist
+        let has_project_id = conn
+            .prepare("SELECT project_id FROM segments LIMIT 1")
+            .is_ok();
+        
+        if !has_project_id {
+            // Add project_id column (default to 1 for existing rows, will be backfilled properly)
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN project_id INTEGER NOT NULL DEFAULT 1",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN src_in_ticks INTEGER",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN src_out_ticks INTEGER",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN segment_kind TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN summary_text TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN keywords_json TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN quality_json TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN subject_json TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN scene_json TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN capture_time TEXT",
+                [],
+            );
+            
+            // Backfill src_in_ticks and src_out_ticks from start_ticks and end_ticks
+            let _ = conn.execute(
+                "UPDATE segments SET src_in_ticks = start_ticks WHERE src_in_ticks IS NULL",
+                [],
+            );
+            let _ = conn.execute(
+                "UPDATE segments SET src_out_ticks = end_ticks WHERE src_out_ticks IS NULL",
+                [],
+            );
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS embeddings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 segment_id INTEGER NOT NULL,
-                model_version TEXT NOT NULL,
+                embedding_type TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                model_version TEXT,
                 vector_blob BLOB NOT NULL,
-                FOREIGN KEY (segment_id) REFERENCES segments(id)
+                semantic_text TEXT,
+                FOREIGN KEY (segment_id) REFERENCES segments(id),
+                UNIQUE(segment_id, embedding_type, model_name)
             )",
             [],
         )?;
+
+        // Migration: Update embeddings table if it has old schema
+        let has_embedding_type = conn
+            .prepare("SELECT embedding_type FROM embeddings LIMIT 1")
+            .is_ok();
+        
+        if !has_embedding_type {
+            // Add new columns
+            let _ = conn.execute(
+                "ALTER TABLE embeddings ADD COLUMN embedding_type TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE embeddings ADD COLUMN model_name TEXT",
+                [],
+            );
+            
+            // Migrate existing embeddings to semantic type
+            let _ = conn.execute(
+                "UPDATE embeddings SET embedding_type = 'semantic', model_name = 'text-embedding-3-small' WHERE embedding_type IS NULL",
+                [],
+            );
+            
+            // Make columns NOT NULL after migration
+            // SQLite doesn't support ALTER COLUMN, so we'll handle NULLs in code
+        }
+        
+        // Migration: Add semantic_text column if it doesn't exist
+        let has_semantic_text = conn
+            .prepare("SELECT semantic_text FROM embeddings LIMIT 1")
+            .is_ok();
+        
+        if !has_semantic_text {
+            let _ = conn.execute(
+                "ALTER TABLE embeddings ADD COLUMN semantic_text TEXT",
+                [],
+            );
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS style_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                project_id INTEGER,
+                reference_asset_ids_json TEXT,
                 json_blob TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
             )",
             [],
         )?;
+
+        // Migration: Add new columns to style_profiles if they don't exist
+        let has_project_id = conn
+            .prepare("SELECT project_id FROM style_profiles LIMIT 1")
+            .is_ok();
+        
+        if !has_project_id {
+            let _ = conn.execute(
+                "ALTER TABLE style_profiles ADD COLUMN project_id INTEGER",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE style_profiles ADD COLUMN reference_asset_ids_json TEXT",
+                [],
+            );
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS timeline_projects (
@@ -203,6 +362,60 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
                 diff_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )",
+            [],
+        )?;
+
+        // New tables for raw analysis results
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS asset_transcripts (
+                asset_id INTEGER PRIMARY KEY,
+                transcript_json TEXT NOT NULL,
+                FOREIGN KEY (asset_id) REFERENCES media_assets(id)
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS asset_vision (
+                asset_id INTEGER PRIMARY KEY,
+                vision_json TEXT NOT NULL,
+                FOREIGN KEY (asset_id) REFERENCES media_assets(id)
+            )",
+            [],
+        )?;
+
+        // New tables for orchestrator history
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS orchestrator_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS orchestrator_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                proposal_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS orchestrator_applies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                edit_plan_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             )",
@@ -390,8 +603,18 @@ impl Database {
 pub struct Segment {
     pub id: i64,
     pub media_asset_id: i64,
+    pub project_id: i64,
     pub start_ticks: i64,
     pub end_ticks: i64,
+    pub src_in_ticks: Option<i64>,
+    pub src_out_ticks: Option<i64>,
+    pub segment_kind: Option<String>,
+    pub summary_text: Option<String>,
+    pub keywords_json: Option<String>,
+    pub quality_json: Option<String>,
+    pub subject_json: Option<String>,
+    pub scene_json: Option<String>,
+    pub capture_time: Option<String>,
     pub transcript: Option<String>,
     pub speaker: Option<String>,
 }
@@ -409,37 +632,50 @@ pub struct MediaAssetInfo {
 
 impl Database {
     /// Get all segments with their media asset info for a project
-    /// Note: For V1, we get all segments. In the future, we'd link media_assets to projects.
-    pub fn get_segments_for_project(&self, _project_id: i64) -> Result<Vec<(Segment, MediaAssetInfo)>> {
+    pub fn get_segments_for_project(&self, project_id: i64) -> Result<Vec<(Segment, MediaAssetInfo)>> {
         let conn = self.conn.lock().unwrap();
         
-        // Join segments with media_assets to get full info
+        // Join segments with media_assets to get full info, filter by project_id
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.media_asset_id, s.start_ticks, s.end_ticks, s.transcript, s.speaker,
+            "SELECT s.id, s.media_asset_id, s.project_id, s.start_ticks, s.end_ticks, 
+                    s.src_in_ticks, s.src_out_ticks, s.segment_kind, s.summary_text, 
+                    s.keywords_json, s.quality_json, s.subject_json, s.scene_json, 
+                    s.capture_time, s.transcript, s.speaker,
                     ma.id, ma.path, ma.duration_ticks, ma.fps_num, ma.fps_den, ma.width, ma.height
              FROM segments s
              INNER JOIN media_assets ma ON s.media_asset_id = ma.id
+             WHERE s.project_id = ?1
              ORDER BY ma.id, s.start_ticks"
         )?;
         
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![project_id], |row| {
             let segment = Segment {
                 id: row.get(0)?,
                 media_asset_id: row.get(1)?,
-                start_ticks: row.get(2)?,
-                end_ticks: row.get(3)?,
-                transcript: row.get(4)?,
-                speaker: row.get(5)?,
+                project_id: row.get(2)?,
+                start_ticks: row.get(3)?,
+                end_ticks: row.get(4)?,
+                src_in_ticks: row.get(5)?,
+                src_out_ticks: row.get(6)?,
+                segment_kind: row.get(7)?,
+                summary_text: row.get(8)?,
+                keywords_json: row.get(9)?,
+                quality_json: row.get(10)?,
+                subject_json: row.get(11)?,
+                scene_json: row.get(12)?,
+                capture_time: row.get(13)?,
+                transcript: row.get(14)?,
+                speaker: row.get(15)?,
             };
             
             let media_asset = MediaAssetInfo {
-                id: row.get(6)?,
-                path: row.get(7)?,
-                duration_ticks: row.get(8)?,
-                fps_num: row.get(9)?,
-                fps_den: row.get(10)?,
-                width: row.get(11)?,
-                height: row.get(12)?,
+                id: row.get(16)?,
+                path: row.get(17)?,
+                duration_ticks: row.get(18)?,
+                fps_num: row.get(19)?,
+                fps_den: row.get(20)?,
+                width: row.get(21)?,
+                height: row.get(22)?,
             };
             
             Ok((segment, media_asset))
@@ -451,6 +687,244 @@ impl Database {
         }
         
         Ok(result)
+    }
+
+    /// Get coalesced src_in_ticks (single source of truth for reading)
+    pub fn get_coalesced_src_in(segment: &Segment) -> i64 {
+        segment.src_in_ticks.unwrap_or(segment.start_ticks)
+    }
+
+    /// Get coalesced src_out_ticks (single source of truth for reading)
+    pub fn get_coalesced_src_out(segment: &Segment) -> i64 {
+        segment.src_out_ticks.unwrap_or(segment.end_ticks)
+    }
+
+    /// Create a new segment with stable identity fields
+    pub fn create_segment(
+        &self,
+        project_id: i64,
+        media_asset_id: i64,
+        src_in_ticks: i64,
+        src_out_ticks: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO segments (project_id, media_asset_id, src_in_ticks, src_out_ticks, start_ticks, end_ticks) 
+             VALUES (?1, ?2, ?3, ?4, ?3, ?4)",
+            params![project_id, media_asset_id, src_in_ticks, src_out_ticks],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update segment metadata fields (enrichable fields)
+    pub fn update_segment_metadata(
+        &self,
+        segment_id: i64,
+        summary_text: Option<&str>,
+        keywords_json: Option<&str>,
+        quality_json: Option<&str>,
+        subject_json: Option<&str>,
+        scene_json: Option<&str>,
+        transcript: Option<&str>,
+        segment_kind: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE segments SET 
+                summary_text = COALESCE(?1, summary_text),
+                keywords_json = COALESCE(?2, keywords_json),
+                quality_json = COALESCE(?3, quality_json),
+                subject_json = COALESCE(?4, subject_json),
+                scene_json = COALESCE(?5, scene_json),
+                transcript = COALESCE(?6, transcript),
+                segment_kind = COALESCE(?7, segment_kind)
+             WHERE id = ?8",
+            params![summary_text, keywords_json, quality_json, subject_json, scene_json, transcript, segment_kind, segment_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get segments for a specific asset
+    pub fn get_segments_by_asset(&self, asset_id: i64) -> Result<Vec<Segment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, media_asset_id, project_id, start_ticks, end_ticks, 
+                    src_in_ticks, src_out_ticks, segment_kind, summary_text, 
+                    keywords_json, quality_json, subject_json, scene_json, 
+                    capture_time, transcript, speaker
+             FROM segments
+             WHERE media_asset_id = ?1
+             ORDER BY start_ticks"
+        )?;
+        
+        let rows = stmt.query_map(params![asset_id], |row| {
+            Ok(Segment {
+                id: row.get(0)?,
+                media_asset_id: row.get(1)?,
+                project_id: row.get(2)?,
+                start_ticks: row.get(3)?,
+                end_ticks: row.get(4)?,
+                src_in_ticks: row.get(5)?,
+                src_out_ticks: row.get(6)?,
+                segment_kind: row.get(7)?,
+                summary_text: row.get(8)?,
+                keywords_json: row.get(9)?,
+                quality_json: row.get(10)?,
+                subject_json: row.get(11)?,
+                scene_json: row.get(12)?,
+                capture_time: row.get(13)?,
+                transcript: row.get(14)?,
+                speaker: row.get(15)?,
+            })
+        })?;
+        
+        let mut segments = Vec::new();
+        for row in rows {
+            segments.push(row?);
+        }
+        Ok(segments)
+    }
+
+    /// Get segment with its embeddings
+    pub fn get_segment_with_embeddings(&self, segment_id: i64) -> Result<Option<(Segment, Vec<(String, String, Vec<u8>)>)>> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Get segment
+        let mut stmt = conn.prepare(
+            "SELECT id, media_asset_id, project_id, start_ticks, end_ticks, 
+                    src_in_ticks, src_out_ticks, segment_kind, summary_text, 
+                    keywords_json, quality_json, subject_json, scene_json, 
+                    capture_time, transcript, speaker
+             FROM segments
+             WHERE id = ?1"
+        )?;
+        
+        let segment_opt: Option<Segment> = stmt.query_row(params![segment_id], |row| {
+            Ok(Segment {
+                id: row.get(0)?,
+                media_asset_id: row.get(1)?,
+                project_id: row.get(2)?,
+                start_ticks: row.get(3)?,
+                end_ticks: row.get(4)?,
+                src_in_ticks: row.get(5)?,
+                src_out_ticks: row.get(6)?,
+                segment_kind: row.get(7)?,
+                summary_text: row.get(8)?,
+                keywords_json: row.get(9)?,
+                quality_json: row.get(10)?,
+                subject_json: row.get(11)?,
+                scene_json: row.get(12)?,
+                capture_time: row.get(13)?,
+                transcript: row.get(14)?,
+                speaker: row.get(15)?,
+            })
+        }).ok();
+        
+        if let Some(segment) = segment_opt {
+            // Get embeddings
+            let mut emb_stmt = conn.prepare(
+                "SELECT embedding_type, model_name, vector_blob
+                 FROM embeddings
+                 WHERE segment_id = ?1"
+            )?;
+            
+            let emb_rows = emb_stmt.query_map(params![segment_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?;
+            
+            let mut embeddings = Vec::new();
+            for row in emb_rows {
+                embeddings.push(row?);
+            }
+            
+            Ok(Some((segment, embeddings)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update asset analysis state timestamp
+    pub fn update_asset_analysis_state(
+        &self,
+        asset_id: i64,
+        field: &str,
+        timestamp: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let timestamp_str = timestamp.map(|s| s.to_string()).unwrap_or_else(|| {
+            Utc::now().to_rfc3339()
+        });
+        
+        match field {
+            "segments_built_at" => {
+                conn.execute(
+                    "UPDATE media_assets SET segments_built_at = ?1 WHERE id = ?2",
+                    params![timestamp_str, asset_id],
+                )?;
+            }
+            "transcript_ready_at" => {
+                conn.execute(
+                    "UPDATE media_assets SET transcript_ready_at = ?1 WHERE id = ?2",
+                    params![timestamp_str, asset_id],
+                )?;
+            }
+            "vision_ready_at" => {
+                conn.execute(
+                    "UPDATE media_assets SET vision_ready_at = ?1 WHERE id = ?2",
+                    params![timestamp_str, asset_id],
+                )?;
+            }
+            "metadata_ready_at" => {
+                conn.execute(
+                    "UPDATE media_assets SET metadata_ready_at = ?1 WHERE id = ?2",
+                    params![timestamp_str, asset_id],
+                )?;
+            }
+            "embeddings_ready_at" => {
+                conn.execute(
+                    "UPDATE media_assets SET embeddings_ready_at = ?1 WHERE id = ?2",
+                    params![timestamp_str, asset_id],
+                )?;
+            }
+            _ => return Err(anyhow::anyhow!("Unknown analysis state field: {}", field)),
+        }
+        Ok(())
+    }
+
+    /// Check if asset prerequisites are ready for job gating
+    pub fn check_asset_prerequisites(
+        &self,
+        asset_id: i64,
+        required_states: &[&str],
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        
+        for state in required_states {
+            let column = match *state {
+                "segments_built" => "segments_built_at",
+                "transcript_ready" => "transcript_ready_at",
+                "vision_ready" => "vision_ready_at",
+                "metadata_ready" => "metadata_ready_at",
+                "embeddings_ready" => "embeddings_ready_at",
+                _ => return Err(anyhow::anyhow!("Unknown state: {}", state)),
+            };
+            
+            let is_ready: bool = conn.query_row(
+                &format!("SELECT {} IS NOT NULL FROM media_assets WHERE id = ?1", column),
+                params![asset_id],
+                |row| row.get(0),
+            )?;
+            
+            if !is_ready {
+                return Ok(false);
+            }
+        }
+        
+        Ok(true)
     }
 
     pub fn get_media_assets_for_project(&self, project_id: i64) -> Result<Vec<MediaAssetInfo>> {
@@ -636,5 +1110,101 @@ impl Database {
             Some(Err(e)) => Err(e.into()),
             None => Ok(None),
         }
+    }
+
+    /// Store raw transcript results for an asset
+    pub fn store_asset_transcript(&self, asset_id: i64, transcript_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO asset_transcripts (asset_id, transcript_json) VALUES (?1, ?2)",
+            params![asset_id, transcript_json],
+        )?;
+        Ok(())
+    }
+
+    /// Get raw transcript results for an asset
+    pub fn get_asset_transcript(&self, asset_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT transcript_json FROM asset_transcripts WHERE asset_id = ?1")?;
+        let mut rows = stmt.query_map(params![asset_id], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?;
+        
+        match rows.next() {
+            Some(Ok(json)) => Ok(Some(json)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Store raw vision analysis results for an asset
+    pub fn store_asset_vision(&self, asset_id: i64, vision_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO asset_vision (asset_id, vision_json) VALUES (?1, ?2)",
+            params![asset_id, vision_json],
+        )?;
+        Ok(())
+    }
+
+    /// Get raw vision analysis results for an asset
+    pub fn get_asset_vision(&self, asset_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT vision_json FROM asset_vision WHERE asset_id = ?1")?;
+        let mut rows = stmt.query_map(params![asset_id], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?;
+        
+        match rows.next() {
+            Some(Ok(json)) => Ok(Some(json)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// Store orchestrator message
+    pub fn store_orchestrator_message(
+        &self,
+        project_id: i64,
+        role: &str,
+        content: &str,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO orchestrator_messages (project_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, role, content, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Store orchestrator proposal
+    pub fn store_orchestrator_proposal(
+        &self,
+        project_id: i64,
+        proposal_json: &str,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO orchestrator_proposals (project_id, proposal_json, created_at) VALUES (?1, ?2, ?3)",
+            params![project_id, proposal_json, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Store orchestrator applied plan
+    pub fn store_orchestrator_apply(
+        &self,
+        project_id: i64,
+        edit_plan_json: &str,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO orchestrator_applies (project_id, edit_plan_json, created_at) VALUES (?1, ?2, ?3)",
+            params![project_id, edit_plan_json, now],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 }
