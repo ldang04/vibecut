@@ -82,6 +82,7 @@ pub async fn process_enrich_segments_from_transcript(
     let _metadata_id = job_manager.create_job(
         crate::jobs::JobType::ComputeSegmentMetadata,
         Some(metadata_payload),
+        None,
     )?;
     
     job_manager.update_job_status(job_id, crate::jobs::JobStatus::Completed, Some(1.0))?;
@@ -205,6 +206,7 @@ pub async fn process_enrich_segments_from_vision(
     let _metadata_id = job_manager.create_job(
         crate::jobs::JobType::ComputeSegmentMetadata,
         Some(metadata_payload),
+        None,
     )?;
     
     job_manager.update_job_status(job_id, crate::jobs::JobStatus::Completed, Some(1.0))?;

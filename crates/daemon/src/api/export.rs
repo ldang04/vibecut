@@ -71,7 +71,7 @@ async fn export(
     });
 
     let job_id = job_manager
-        .create_job(JobType::Export, Some(job_payload))
+        .create_job(JobType::Export, Some(job_payload), None)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // TODO: Spawn async task to execute FFmpeg command

@@ -225,21 +225,21 @@ export function Toolbar({
 
       {/* Conditionally render Generate button based on feature flag */}
       {import.meta.env.VITE_VIBECUT_ORCHESTRATOR !== 'true' && !import.meta.env.DEV && (
-        <button
-          onClick={onGenerate}
-          disabled={isGenerating}
-          style={{
-            backgroundColor: isGenerating ? '#505050' : '#10b981',
-            color: 'white',
-            border: 'none',
-            padding: '0.375rem 0.75rem',
-            fontSize: '0.875rem',
-            borderRadius: '4px',
-            cursor: isGenerating ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {isGenerating ? 'Generating...' : 'Generate'}
-        </button>
+      <button
+        onClick={onGenerate}
+        disabled={isGenerating}
+        style={{
+          backgroundColor: isGenerating ? '#505050' : '#10b981',
+          color: 'white',
+          border: 'none',
+          padding: '0.375rem 0.75rem',
+          fontSize: '0.875rem',
+          borderRadius: '4px',
+          cursor: isGenerating ? 'not-allowed' : 'pointer',
+        }}
+      >
+        {isGenerating ? 'Generating...' : 'Generate'}
+      </button>
       )}
 
       <button

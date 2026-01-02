@@ -24,3 +24,5 @@ pip install faster-whisper==1.0.3 || {
 
 echo "Installation complete! If av failed to build, that's okay - it's not used by the ML service."
 
+
+

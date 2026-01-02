@@ -2,6 +2,41 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import os
+import json
+from pathlib import Path
+
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    import sys
+    
+    # Try to load .env from project root (two levels up) or current directory
+    env_path = Path(__file__).parent.parent.parent / '.env'
+    if not env_path.exists():
+        env_path = Path(__file__).parent / '.env'
+    
+    if env_path.exists():
+        load_dotenv(env_path, override=True)
+        # Use sys.stderr to ensure it shows up in uvicorn logs
+        print(f"[INFO] Loaded .env from {env_path}", file=sys.stderr, flush=True)
+        # Verify OPENAI_API_KEY is loaded
+        if os.getenv('OPENAI_API_KEY'):
+            api_key_preview = os.getenv('OPENAI_API_KEY')[:20] + '...' if len(os.getenv('OPENAI_API_KEY', '')) > 20 else '***'
+            print(f"[INFO] OPENAI_API_KEY loaded: {api_key_preview}", file=sys.stderr, flush=True)
+        else:
+            print(f"[WARNING] .env file found but OPENAI_API_KEY not set", file=sys.stderr, flush=True)
+    else:
+        # Also try loading from current directory
+        load_dotenv(override=True)
+        if os.getenv('OPENAI_API_KEY'):
+            print(f"[INFO] Loaded .env from current directory", file=sys.stderr, flush=True)
+        else:
+            print(f"[WARNING] No .env file found and OPENAI_API_KEY not set in environment", file=sys.stderr, flush=True)
+except ImportError:
+    # python-dotenv not installed, skip .env loading
+    print("[WARNING] python-dotenv not installed, .env file will not be loaded", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"[ERROR] Failed to load .env file: {e}", file=sys.stderr, flush=True)
 
 app = FastAPI(title="VibeCut ML Service", version="0.1.0")
 
@@ -468,6 +503,324 @@ class GeneratePlanRequest(BaseModel):
     beats: List[Dict]
     constraints: Dict
     style_profile_id: Optional[int] = None
+
+
+class GenerateResponseRequest(BaseModel):
+    conversation_history: List[dict]
+    project_state: dict
+    context: dict
+    event_type: str
+
+
+class GenerateResponseResponse(BaseModel):
+    message: str
+    suggestions: List[dict]  # [{"label": str, "action": str, "confirm_token": Optional[str]}]
+    questions: List[str]
+    # Note: next_action and confidence removed - control flow is deterministic
+
+
+@app.post("/orchestrator/generate_response", response_model=GenerateResponseResponse)
+async def generate_response(request: GenerateResponseRequest) -> GenerateResponseResponse:
+    """
+    Generate intelligent, contextual agent response using LLM.
+    
+    Args:
+        request: Contains conversation_history, project_state, context, event_type
+    
+    Returns:
+        GenerateResponseResponse with LLM-generated message, suggestions, and questions
+    """
+    try:
+        from openai import OpenAI
+        
+        # Initialize OpenAI client (use environment variable OPENAI_API_KEY)
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="OPENAI_API_KEY not set. Please set it in your .env file or environment variables."
+            )
+        client = OpenAI(api_key=api_key)
+        
+        # Build system prompt
+        system_prompt = """You are a helpful, intelligent video editing assistant for VibeCut. You help users create video edits by understanding their creative vision and taking action.
+
+CRITICAL: Read the conversation history carefully. Acknowledge what the user actually said. Reference their specific requests. Be conversational and natural, not robotic.
+
+Your personality:
+- Friendly, helpful, and conversational
+- Acknowledge the user's specific requests (e.g., "I want to make a vlog of me getting ready" → acknowledge this)
+- Show understanding of context (what they asked for, what's been done)
+- Be proactive but not pushy
+- Vary your responses - don't repeat the same phrases
+
+When responding:
+1. Acknowledge what the user said (e.g., "Got it - a vlog of you getting ready!")
+2. ACTUALLY DO what you say you'll do - don't just talk about doing it
+3. If you say "I'll show you segments" - the system will automatically show them, so describe what you found, not what you'll do
+4. Be specific and natural - avoid generic phrases like "candidate segments ready"
+5. When segments are found, describe them: "I found 4 moments: [describe each one briefly]"
+6. Don't say "I'll pull them up" or "let me show you" - just describe what's there
+
+CRITICAL: If the user asks "what's the plan?" or "describe the plan" or similar:
+- Create a NARRATIVE description of the video plot/story, not just technical details
+- Use the segment descriptions provided in the context to tell the story
+- Describe the flow: "The video starts with [first moment], then cuts to [second moment], followed by [third moment]..."
+- Be specific about what's happening in each moment (e.g., "forest pan shot" → "a panning shot through the forest")
+- Make it sound like a story, not a technical spec
+- Example: "The video opens with a panning shot through the forest, then cuts to a person walking their dog along a path, followed by a close-up of the dog..."
+
+IMPORTANT: When segments are found and returned to you:
+- The system has ALREADY retrieved them - you don't need to say "I'll show you"
+- ONLY describe segments using the exact descriptions provided in the context
+- DO NOT make up or invent descriptions - if a segment says "video segment" or is generic, acknowledge that
+- If segment descriptions are generic/placeholder, say: "I found X segments, but they need more analysis for detailed descriptions"
+- Only use specific, detailed descriptions that are actually provided - never hallucinate content
+- Don't say "I'll pull them up" or "let me show you" - they're already shown, just describe what's actually there
+
+Available actions (suggest these when appropriate):
+- "generate_plan": User wants to create an edit plan
+- "apply_plan": User wants to apply a plan to the timeline
+- "import_clips": User needs to import video clips
+- "analyze_clips": Start analyzing clips
+- "overwrite_timeline": Overwrite existing timeline
+- "create_new_version": Create new timeline version
+- "broaden_search": Expand search for segments
+- "show_all_moments": Show all available segments
+- "show_progress": Show analysis progress
+- "cancel": Cancel current operation
+
+Return JSON with: message (natural, conversational text), suggestions (array of {label, action, confirm_token}), questions (if you need clarification).
+"""
+        
+        # Build user prompt with context - make it conversational
+        user_prompt_parts = []
+        
+        # Include conversation history first so LLM understands context
+        if request.conversation_history:
+            user_prompt_parts.append("Conversation so far:")
+            for msg in request.conversation_history[-10:]:  # Last 10 messages
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                if role == "user":
+                    user_prompt_parts.append(f"User: {content}")
+                elif role == "assistant":
+                    user_prompt_parts.append(f"Assistant: {content}")
+        
+        # Add current context
+        user_prompt_parts.append(f"\nCurrent situation:")
+        user_prompt_parts.append(f"- Event: {request.event_type}")
+        
+        if request.context and request.context.get("user_intent"):
+            user_prompt_parts.append(f"- User's latest request: {request.context['user_intent']}")
+        
+        user_prompt_parts.append(f"- Project has {request.project_state.get('segments_count', 0)} segments analyzed")
+        if request.context and request.context.get("candidate_count"):
+            candidate_count = request.context.get("candidate_count", 0)
+            user_prompt_parts.append(f"- Found {candidate_count} relevant segments for the edit")
+            
+            # Include segment descriptions if available
+            if request.context.get("segment_descriptions"):
+                segment_descriptions = request.context.get("segment_descriptions", [])
+                if segment_descriptions:
+                    user_prompt_parts.append(f"- Segment descriptions (in order):")
+                    generic_count = 0
+                    for i, desc in enumerate(segment_descriptions[:10], 1):  # First 10
+                        if desc.lower() in ["video segment", "video", "segment"] or len(desc.strip()) < 5:
+                            generic_count += 1
+                            user_prompt_parts.append(f"  {i}. [generic/placeholder - no detailed description available]")
+                        else:
+                            user_prompt_parts.append(f"  {i}. {desc}")
+                    
+                    if generic_count > 0:
+                        user_prompt_parts.append(f"  CRITICAL: {generic_count} segments have generic descriptions. DO NOT make up descriptions!")
+                        user_prompt_parts.append(f"  Only describe segments that have real, specific descriptions above.")
+                        user_prompt_parts.append(f"  For generic segments, say something like: 'I found {candidate_count} segments, but some need more analysis to get detailed descriptions.'")
+                    else:
+                        user_prompt_parts.append(f"  CRITICAL: Describe ONLY these segments using the exact descriptions above!")
+                        user_prompt_parts.append(f"  Say 'I found {candidate_count} moments: [describe each using the descriptions above]'")
+                        user_prompt_parts.append(f"  DO NOT make up descriptions - only use what's provided above!")
+                    user_prompt_parts.append(f"  Don't say 'I'll show you' - they're already shown! Just describe what you found.")
+            else:
+                user_prompt_parts.append(f"  WARNING: No segment descriptions available. DO NOT make up descriptions!")
+                user_prompt_parts.append(f"  Say something like: 'I found {candidate_count} segments, but I need more analysis to describe them in detail.'")
+        
+        if request.context and request.context.get("goal"):
+            goal_obj = request.context.get("goal", {})
+            if isinstance(goal_obj, dict):
+                user_prompt_parts.append(f"- Active goal: {goal_obj.get('intent', '')} (status: {goal_obj.get('status', '')})")
+        
+        # Include edit plan details if available
+        if request.context and request.context.get("edit_plan"):
+            plan_obj = request.context.get("edit_plan", {})
+            if isinstance(plan_obj, dict) and plan_obj.get("has_plan"):
+                user_prompt_parts.append(f"- Edit plan exists: {plan_obj.get('plan_summary', 'plan ready')}")
+                
+                # Include segment descriptions for narrative description
+                segment_descriptions = plan_obj.get("segment_descriptions", [])
+                if segment_descriptions:
+                    user_prompt_parts.append(f"- Segment descriptions in order:")
+                    for i, desc in enumerate(segment_descriptions, 1):
+                        user_prompt_parts.append(f"  {i}. {desc}")
+                    user_prompt_parts.append(f"  CRITICAL: If user asks 'what's the plan?' or 'describe the plan', create a narrative description of the video plot using these segment descriptions!")
+                    user_prompt_parts.append(f"  Example: 'The video starts with [first segment], then cuts to [second segment], followed by [third segment]...'")
+                    user_prompt_parts.append(f"  Be specific about what's happening in each moment, not just technical details!")
+        
+        user_prompt_parts.append("\nGenerate a natural, conversational response that acknowledges what the user said and explains what's happening or what you're doing.")
+        
+        user_prompt = "\n".join(user_prompt_parts)
+        
+        # Call OpenAI API
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",  # Use cheaper model for responses
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.9,  # Higher temperature for more natural, varied responses
+            )
+        except Exception as api_error:
+            # Check if it's an authentication error
+            error_str = str(api_error).lower()
+            if "api key" in error_str or "authentication" in error_str or "unauthorized" in error_str:
+                print(f"[ERROR] OpenAI API key not set or invalid. Please set OPENAI_API_KEY environment variable.")
+                raise HTTPException(
+                    status_code=500,
+                    detail="OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+                )
+            else:
+                raise
+        
+        # Parse response
+        response_text = response.choices[0].message.content
+        if not response_text:
+            raise HTTPException(status_code=500, detail="OpenAI returned empty response")
+        
+        response_json = json.loads(response_text)
+        
+        # Extract and validate suggestions
+        suggestions_raw = response_json.get("suggestions", [])
+        suggestions = []
+        for sug in suggestions_raw:
+            if isinstance(sug, dict) and "label" in sug and "action" in sug:
+                suggestions.append({
+                    "label": sug["label"],
+                    "action": sug["action"],
+                    "confirm_token": sug.get("confirm_token"),
+                })
+        
+        return GenerateResponseResponse(
+            message=response_json.get("message", "I'm here to help!"),
+            suggestions=suggestions,
+            questions=response_json.get("questions", []),
+        )
+        
+    except ImportError as e:
+        # OpenAI library not installed - log and raise
+        print(f"[ERROR] OpenAI library not available: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail="OpenAI library not installed. Please install with: pip install openai"
+        )
+    except Exception as e:
+        # Log the full error for debugging
+        import traceback
+        print(f"[ERROR] LLM response generation failed: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Response generation failed: {str(e)}")
+
+
+class ParseIntentRequest(BaseModel):
+    user_message: str
+    conversation_history: Optional[List[dict]] = None
+
+
+class ParseIntentResponse(BaseModel):
+    user_intent: str
+    target_length_sec: Optional[int] = None
+    vibe: Optional[str] = None
+    constraints: Optional[dict] = None
+    clarifying_questions: List[str] = []
+
+
+@app.post("/orchestrator/parse_intent", response_model=ParseIntentResponse)
+async def parse_intent(request: ParseIntentRequest) -> ParseIntentResponse:
+    """
+    Parse natural language user message into structured intent.
+    
+    Args:
+        request: Contains user_message and optional conversation_history
+    
+    Returns:
+        ParseIntentResponse with structured intent fields
+    """
+    try:
+        from openai import OpenAI
+        
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="OPENAI_API_KEY not set. Please set it in your .env file or environment variables."
+            )
+        client = OpenAI(api_key=api_key)
+        
+        system_prompt = """You are a video editing assistant. Parse the user's natural language message into structured intent.
+
+Extract:
+- user_intent: A clear, concise description of what the user wants
+- target_length_sec: Target video length in seconds (if mentioned)
+- vibe: Editing style/vibe (e.g., "cinematic", "casual", "fast-paced", "cozy")
+- constraints: Object with:
+  - unused_only: true if user wants only unused clips
+  - selected_clips: array of clip IDs if user specified specific clips
+  - quality_threshold: minimum quality if mentioned
+- clarifying_questions: Array of questions to ask if intent is ambiguous
+
+Return JSON with: user_intent, target_length_sec (optional), vibe (optional), constraints (optional), clarifying_questions (array)."""
+        
+        user_prompt = f"User message: {request.user_message}"
+        if request.conversation_history:
+            user_prompt += "\n\nRecent conversation:"
+            for msg in request.conversation_history[-5:]:
+                role = msg.get("role", "unknown")
+                content = msg.get("content", "")
+                user_prompt += f"\n{role}: {content}"
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,  # Lower temperature for more deterministic parsing
+        )
+        
+        response_text = response.choices[0].message.content
+        response_json = json.loads(response_text)
+        
+        return ParseIntentResponse(
+            user_intent=response_json.get("user_intent", request.user_message),
+            target_length_sec=response_json.get("target_length_sec"),
+            vibe=response_json.get("vibe"),
+            constraints=response_json.get("constraints"),
+            clarifying_questions=response_json.get("clarifying_questions", []),
+        )
+        
+    except ImportError:
+        # Fallback: return basic intent
+        return ParseIntentResponse(
+            user_intent=request.user_message,
+            target_length_sec=None,
+            vibe=None,
+            constraints=None,
+            clarifying_questions=[],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Intent parsing failed: {str(e)}")
 
 
 @app.post("/orchestrator/generate_plan")

@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { usePropose, useGeneratePlan, useApplyPlan } from '../hooks/useOrchestrator';
+import { useOrchestrator } from '../hooks/useOrchestrator';
+import { useOrchestratorEvents } from '../hooks/useOrchestratorEvents';
 
 interface OrchestratorPanelProps {
   projectId: number;
@@ -16,17 +17,40 @@ export const OrchestratorPanel: React.FC<OrchestratorPanelProps> = ({ projectId 
   const [userInput, setUserInput] = useState('');
   const [proposal, setProposal] = useState<{ candidate_segments: Array<{ segment_id: number; duration_sec: number }>; narrative_structure?: string } | null>(null);
   const [editPlan, setEditPlan] = useState<Record<string, unknown> | null>(null);
-  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [suggestions, setSuggestions] = useState<Array<{ label: string; action: string; confirm_token?: string | null }>>([]);
   const [questions, setQuestions] = useState<string[]>([]);
   const [currentMode, setCurrentMode] = useState<'talk' | 'busy' | 'act'>('talk');
-  const [showProgress, setShowProgress] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const streamingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   
-  const { propose, isLoading: isProposing } = usePropose(projectId);
-  const { generatePlan, isLoading: isGenerating } = useGeneratePlan(projectId);
-  const { applyPlan, isLoading: isApplying } = useApplyPlan(projectId);
+  const { propose, generatePlan, applyPlan, getMessages, isProposing, isGenerating, isApplying } = useOrchestrator(projectId);
+
+  // Subscribe to orchestrator events for proactive messages
+  useOrchestratorEvents(projectId, async (event) => {
+    if (event.type === 'AnalysisComplete' && event.project_id === projectId) {
+      // Fetch new messages from the database when analysis completes
+      // The agent has already generated a proactive message
+      try {
+        const newMessages = await getMessages();
+        // Filter to only new messages (not already in state)
+        const existingContents = new Set(messages.map(m => m.content));
+        const messagesToAdd = newMessages
+          .filter((msg: any) => !existingContents.has(msg.content))
+          .map((msg: any) => ({
+            role: msg.role as 'user' | 'assistant',
+            content: msg.content,
+            isStreaming: false,
+          }));
+        
+        if (messagesToAdd.length > 0) {
+          setMessages(prev => [...prev, ...messagesToAdd]);
+        }
+      } catch (error) {
+        console.error('Error fetching messages after analysis complete:', error);
+      }
+    }
+  });
 
   // Auto-resize textarea
   useEffect(() => {
@@ -86,6 +110,66 @@ export const OrchestratorPanel: React.FC<OrchestratorPanelProps> = ({ projectId 
   const handleSendMessage = async () => {
     if (!userInput.trim()) return;
 
+    const userInputLower = userInput.trim().toLowerCase();
+    
+    // Check if user is confirming an action
+    const isConfirmation = ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'go ahead', 'do it', 'generate', 'create', 'show', 'review'].includes(userInputLower);
+    
+    // Check last assistant message to see what they're confirming
+    const lastAssistantMessage = messages.filter(m => m.role === 'assistant').pop();
+    const lastMessageContent = lastAssistantMessage?.content.toLowerCase() || '';
+    
+    // If user says "yes" and last message was about showing/reviewing segments, automatically propose
+    if (isConfirmation && (lastMessageContent.includes('show') || lastMessageContent.includes('review') || lastMessageContent.includes('segments') || lastMessageContent.includes('moments') || lastMessageContent.includes('check out'))) {
+      setUserInput('');
+      // Automatically trigger propose to show segments
+      try {
+        const result = await propose({
+          user_intent: "show me the segments",
+          filters: undefined,
+          context: undefined,
+        });
+        
+        const messageIndex = messages.length + 1;
+        setMessages(prev => [...prev, {
+          role: 'assistant',
+          content: '',
+          isStreaming: true,
+        }]);
+        
+        setTimeout(() => {
+          streamMessage(messageIndex, result.message, 15);
+        }, 50);
+        
+        setCurrentMode(result.mode);
+        setSuggestions([]);
+        setQuestions([]);
+        
+        if (result.mode === 'act' && result.data) {
+          setProposal(result.data);
+        } else {
+          setProposal(null);
+        }
+      } catch (error) {
+        console.error('Error proposing edit:', error);
+      }
+      return;
+    }
+    
+    // If user says "yes" and last message was about generating a plan, trigger generate plan
+    if (isConfirmation && proposal && (lastMessageContent.includes('generate') || lastMessageContent.includes('edit plan') || lastMessageContent.includes('plan'))) {
+      setUserInput('');
+      handleGeneratePlan();
+      return;
+    }
+    
+    // If user says "yes" and last message was about applying plan, trigger apply plan
+    if (isConfirmation && editPlan && (lastMessageContent.includes('apply') || lastMessageContent.includes('timeline'))) {
+      setUserInput('');
+      handleApplyPlan();
+      return;
+    }
+
     const userMessage = { role: 'user' as const, content: userInput };
     const messageToSend = userInput;
     setMessages(prev => [...prev, userMessage]);
@@ -111,31 +195,14 @@ export const OrchestratorPanel: React.FC<OrchestratorPanelProps> = ({ projectId 
         streamMessage(messageIndex, result.message, 15); // 15ms per character for smooth streaming
       }, 50);
 
-      // Handle mode-specific UI
+      // Handle mode-specific UI - only store proposal data, no buttons
       setCurrentMode(result.mode);
+      setSuggestions([]); // No buttons - everything through chat
+      setQuestions([]);
       
-      if (result.mode === 'busy') {
-        // Show progress indicator
-        setShowProgress(true);
-        setSuggestions([]);
-        setQuestions([]);
-        setProposal(null);
-      } else if (result.mode === 'talk') {
-        // Show suggestions as buttons and questions
-        setShowProgress(false);
-        setSuggestions(result.suggestions || []);
-        setQuestions(result.questions || []);
-        setProposal(null);
-      } else if (result.mode === 'act' && result.data) {
-        // Show proposal with "Generate Plan" button
-        setShowProgress(false);
-        setSuggestions(result.suggestions || []);
-        setQuestions([]);
+      if (result.mode === 'act' && result.data) {
         setProposal(result.data);
       } else {
-        setShowProgress(false);
-        setSuggestions([]);
-        setQuestions([]);
         setProposal(null);
       }
     } catch (error) {
@@ -281,6 +348,12 @@ export const OrchestratorPanel: React.FC<OrchestratorPanelProps> = ({ projectId 
           0%, 50% { opacity: 1; }
           51%, 100% { opacity: 0; }
         }
+        @keyframes flicker {
+          0%, 100% { opacity: 1; }
+          25% { opacity: 0.6; }
+          50% { opacity: 0.8; }
+          75% { opacity: 0.5; }
+        }
       `}</style>
       <div style={{
         width: '100%',
@@ -332,230 +405,26 @@ export const OrchestratorPanel: React.FC<OrchestratorPanelProps> = ({ projectId 
           </div>
         ))}
 
-        {/* Show progress indicator for BUSY mode */}
-        {showProgress && currentMode === 'busy' && (
+        {/* Show loading indicator while processing */}
+        {(isProposing || isGenerating || isApplying) && (
           <div style={{
             marginTop: '0.75rem',
             padding: '0.75rem',
             backgroundColor: '#1e1e1e',
             borderRadius: '4px',
             border: '1px solid #404040',
+            textAlign: 'center',
           }}>
             <div style={{ 
-              fontSize: '12px',
-              color: '#999',
-              marginBottom: '0.5rem',
-            }}>
-              Analyzing...
-            </div>
-            <div style={{
-              width: '100%',
-              height: '4px',
-              backgroundColor: '#404040',
-              borderRadius: '2px',
-              overflow: 'hidden',
-            }}>
-              <div style={{
-                width: '60%',
-                height: '100%',
-                backgroundColor: '#3b82f6',
-                animation: 'pulse 1.5s ease-in-out infinite',
-              }} />
-            </div>
-          </div>
-        )}
-
-        {/* Show suggestions as buttons */}
-        {suggestions.length > 0 && (
-          <div style={{
-            marginTop: '0.75rem',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '0.5rem',
-          }}>
-            {suggestions.map((suggestion, idx) => (
-              <button
-                key={idx}
-                onClick={() => {
-                  if (suggestion === 'Import clips') {
-                    // Trigger import action (would need to be implemented)
-                    console.log('Import clips clicked');
-                  } else if (suggestion === 'Analyze clips') {
-                    // Trigger analysis (would need to be implemented)
-                    console.log('Analyze clips clicked');
-                  } else if (suggestion === 'Generate Plan') {
-                    handleGeneratePlan();
-                  } else if (suggestion === 'Apply Plan') {
-                    handleApplyPlan(undefined);
-                  } else if (suggestion === 'Overwrite timeline') {
-                    handleApplyPlan('overwrite');
-                  } else if (suggestion === 'Create new version') {
-                    handleApplyPlan('new_version');
-                  } else if (suggestion === 'Cancel') {
-                    setSuggestions([]);
-                    setEditPlan(null);
-                  } else {
-                    // Generic suggestion click
-                    setUserInput(suggestion);
-                  }
-                }}
-                style={{
-                  width: '100%',
-                  padding: '0.5rem',
-                  backgroundColor: '#2a2a2a',
-                  color: '#e5e5e5',
-                  border: '1px solid #404040',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontSize: '13px',
-                  textAlign: 'left',
-                  transition: 'background-color 0.2s',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.backgroundColor = '#353535';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.backgroundColor = '#2a2a2a';
-                }}
-              >
-                {suggestion}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {/* Show questions */}
-        {questions.length > 0 && (
-          <div style={{
-            marginTop: '0.75rem',
-            padding: '0.75rem',
-            backgroundColor: '#1e1e1e',
-            borderRadius: '4px',
-            border: '1px solid #404040',
-          }}>
-            <div style={{ 
-              fontSize: '12px',
-              color: '#999',
-              marginBottom: '0.5rem',
-            }}>
-              Questions:
-            </div>
-            {questions.map((question, idx) => (
-              <div key={idx} style={{
-                fontSize: '12px',
-                color: '#ccc',
-                marginBottom: '0.25rem',
-                paddingLeft: '0.5rem',
-              }}>
-                • {question}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Show proposal for ACT mode */}
-        {proposal && proposal.candidate_segments && (
-          <div style={{
-            marginTop: '0.75rem',
-            padding: '0.75rem',
-            backgroundColor: '#1e1e1e',
-            borderRadius: '4px',
-            border: '1px solid #404040',
-          }}>
-            <div style={{ 
-              fontWeight: 600, 
-              marginBottom: '0.5rem',
               fontSize: '13px',
-              color: '#e5e5e5',
+              color: '#10b981',
+              animation: 'flicker 1.5s ease-in-out infinite',
             }}>
-              Proposal
+              Planning next moves
             </div>
-            <div style={{ 
-              fontSize: '12px', 
-              marginBottom: '0.75rem',
-              color: '#999',
-            }}>
-              Found {proposal.candidate_segments.length} candidate segments
-            </div>
-            {!editPlan && (
-              <button
-                onClick={handleGeneratePlan}
-                disabled={isGenerating}
-                style={{
-                  width: '100%',
-                  padding: '0.5rem',
-                  backgroundColor: isGenerating ? '#505050' : '#3b82f6',
-                  color: '#ffffff',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: isGenerating ? 'not-allowed' : 'pointer',
-                  fontSize: '13px',
-                  fontWeight: 500,
-                  transition: 'background-color 0.2s',
-                }}
-                onMouseEnter={(e) => {
-                  if (!isGenerating) {
-                    e.currentTarget.style.backgroundColor = '#2563eb';
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  if (!isGenerating) {
-                    e.currentTarget.style.backgroundColor = '#3b82f6';
-                  }
-                }}
-              >
-                {isGenerating ? 'Generating...' : 'Generate Plan'}
-              </button>
-            )}
           </div>
         )}
 
-        {editPlan && (
-          <div style={{
-            marginTop: '0.75rem',
-            padding: '0.75rem',
-            backgroundColor: '#1e1e1e',
-            borderRadius: '4px',
-            border: '1px solid #404040',
-          }}>
-            <div style={{ 
-              fontWeight: 600, 
-              marginBottom: '0.75rem',
-              fontSize: '13px',
-              color: '#e5e5e5',
-            }}>
-              Edit Plan Ready
-            </div>
-            <button
-              onClick={() => handleApplyPlan(undefined)}
-              disabled={isApplying}
-              style={{
-                width: '100%',
-                padding: '0.5rem',
-                backgroundColor: isApplying ? '#505050' : '#10b981',
-                color: '#ffffff',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: isApplying ? 'not-allowed' : 'pointer',
-                fontSize: '13px',
-                fontWeight: 500,
-                transition: 'background-color 0.2s',
-              }}
-              onMouseEnter={(e) => {
-                if (!isApplying) {
-                  e.currentTarget.style.backgroundColor = '#059669';
-                }
-              }}
-              onMouseLeave={(e) => {
-                if (!isApplying) {
-                  e.currentTarget.style.backgroundColor = '#10b981';
-                }
-              }}
-            >
-              {isApplying ? 'Applying...' : 'Apply Plan'}
-            </button>
-          </div>
-        )}
       </div>
 
       <div style={{

@@ -147,6 +147,7 @@ pub async fn process_compute_segment_metadata(
     let embed_id = job_manager.create_job(
         crate::jobs::JobType::EmbedSegments,
         Some(embed_payload),
+        None,
     )?;
     eprintln!("[METADATA] Queued EmbedSegments job {} for asset_id: {}", embed_id, asset_id);
     

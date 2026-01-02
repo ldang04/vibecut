@@ -358,6 +358,21 @@ pub async fn process_embed_segments(
     // Update asset analysis state
     db.update_asset_analysis_state(asset_id, "embeddings_ready_at", None)?;
     
+    // Get project_id from asset to emit AnalysisComplete event
+    let project_id = {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT project_id FROM media_assets WHERE id = ?1",
+            params![asset_id],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0)
+    };
+    
+    if project_id > 0 {
+        // Emit AnalysisComplete event for orchestrator
+        job_manager.emit_analysis_complete(asset_id, project_id, "Embedded".to_string());
+    }
+    
     eprintln!("[EMBEDDING] Completed EmbedSegments job {} for asset_id: {} (processed {} segments)", job_id, asset_id, processed_count);
     job_manager.update_job_status(job_id, crate::jobs::JobStatus::Completed, Some(1.0))?;
     

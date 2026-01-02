@@ -9,6 +9,7 @@ pub mod generate;
 pub mod jobs;
 pub mod media;
 pub mod orchestrator;
+pub mod orchestrator_helper;
 pub mod projects;
 pub mod style;
 pub mod timeline;

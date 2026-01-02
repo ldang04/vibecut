@@ -237,10 +237,10 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
   const handleJobUpdate = (job: any) => {
     // Handle job updates from MediaLibrary
     // Track upload jobs and analysis jobs separately
-    const status = typeof job.status === 'string' && job.status.startsWith('"') 
-      ? JSON.parse(job.status) 
-      : job.status;
-    
+      const status = typeof job.status === 'string' && job.status.startsWith('"') 
+        ? JSON.parse(job.status) 
+        : job.status;
+      
     // Parse job type - it comes as a JSON string from the API
     // The API serializes the enum as a JSON string, so job.job_type is already a string like "TranscribeAsset"
     // But it might be double-encoded, so we need to handle both cases
@@ -290,13 +290,13 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
       status 
     });
     
-    if (status === 'Pending' || status === 'Running') {
+      if (status === 'Pending' || status === 'Running') {
       if (isUploadJob) {
         console.log('[Editor] Adding upload job:', job.id);
         setActiveJobIds((prev) => {
           const newSet = new Set(prev);
-          newSet.add(job.id);
-          return newSet;
+        newSet.add(job.id);
+        return newSet;
         });
       }
       if (isAnalysisJob) {
@@ -308,13 +308,13 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
           return newSet;
         });
       }
-    } else if (status === 'Completed' || status === 'Failed' || status === 'Cancelled') {
+      } else if (status === 'Completed' || status === 'Failed' || status === 'Cancelled') {
       if (isUploadJob) {
         console.log('[Editor] Removing upload job:', job.id);
         setActiveJobIds((prev) => {
           const newSet = new Set(prev);
-          newSet.delete(job.id);
-          return newSet;
+        newSet.delete(job.id);
+        return newSet;
         });
       }
       if (isAnalysisJob) {
@@ -322,8 +322,8 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
         setActiveAnalysisJobIds((prev) => {
           const newSet = new Set(prev);
           newSet.delete(job.id);
-          return newSet;
-        });
+      return newSet;
+    });
       }
     }
   };
@@ -1426,27 +1426,27 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
         {/* Media Sidebar - leftmost (fixed width) */}
         <div style={{ width: isSidebarCollapsed ? '40px' : '120px', overflow: 'hidden', flexShrink: 0, display: 'flex', flexDirection: 'column' }}>
-          <MediaSidebar 
-            selectedTab={mediaTab} 
-            onTabChange={setMediaTab}
-            onCollapseChange={setIsSidebarCollapsed}
-          />
-        </div>
+        <MediaSidebar 
+          selectedTab={mediaTab} 
+          onTabChange={setMediaTab}
+          onCollapseChange={setIsSidebarCollapsed}
+        />
+      </div>
 
         {/* Media Library */}
         <div style={{ width: `${libraryWidth}px`, overflow: 'hidden', flexShrink: 0, display: 'flex', flexDirection: 'column' }}>
-          <MediaLibrary
-            mode={mediaTab}
-            onClipSelect={handleLibraryClipSelect}
-            onImportComplete={handleImportComplete}
-            onJobUpdate={handleJobUpdate}
-            projectId={projectId}
-            onDragStart={handleDragStart}
-            onDragEnd={handleDragEnd}
-            externalDragAsset={dragAsset}
-          />
-        </div>
-        
+        <MediaLibrary
+          mode={mediaTab}
+          onClipSelect={handleLibraryClipSelect}
+          onImportComplete={handleImportComplete}
+          onJobUpdate={handleJobUpdate}
+          projectId={projectId}
+          onDragStart={handleDragStart}
+          onDragEnd={handleDragEnd}
+          externalDragAsset={dragAsset}
+        />
+      </div>
+
         {/* Resize handle between library and viewer */}
         <div
           onMouseDown={(e) => handleResizeStart('library', e)}
@@ -1461,35 +1461,35 @@ export function Editor({ projectId, currentProjectName, projects, onProjectSelec
 
         {/* Viewer - center (takes remaining space) */}
         <div style={{ flex: 1, overflow: 'hidden', position: 'relative', display: 'flex', minWidth: 0 }}>
-          <div style={{ flex: 1, overflow: 'hidden' }}>
-            <Viewer
-              videoSrc={hoverVideoSrc || videoSrc}
-              startTime={hoverSourceTime !== undefined ? hoverSourceTime : videoStartTime}
-              endTime={videoEndTime}
-              currentTime={currentTime}
-              onTimeUpdate={handleTimeUpdate}
-              onEnded={isTimelinePlaying ? handleVideoEnded : undefined}
-              isPlaying={isTimelinePlaying}
-              timelineHoverTime={hoverTime}
-              onPlayPause={(playing) => {
-                // When user clicks play/pause button in video player, sync with timeline playback
-                if (playing && !isTimelinePlaying) {
-                  startTimelinePlayback();
-                } else if (!playing && isTimelinePlaying) {
-                  stopTimelinePlayback();
-                }
-              }}
-            />
-          </div>
+        <div style={{ flex: 1, overflow: 'hidden' }}>
+        <Viewer
+          videoSrc={hoverVideoSrc || videoSrc}
+          startTime={hoverSourceTime !== undefined ? hoverSourceTime : videoStartTime}
+          endTime={videoEndTime}
+          currentTime={currentTime}
+          onTimeUpdate={handleTimeUpdate}
+          onEnded={isTimelinePlaying ? handleVideoEnded : undefined}
+          isPlaying={isTimelinePlaying}
+          timelineHoverTime={hoverTime}
+          onPlayPause={(playing) => {
+            // When user clicks play/pause button in video player, sync with timeline playback
+            if (playing && !isTimelinePlaying) {
+              startTimelinePlayback();
+            } else if (!playing && isTimelinePlaying) {
+              stopTimelinePlayback();
+            }
+          }}
+        />
+        </div>
           {/* Text Editor Panel or Orchestrator Panel - to the right of playback */}
           {editingTextClip ? (
             <div style={{ width: '200px', borderLeft: '1px solid #404040', backgroundColor: '#1a1a1a', display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
-              <TextEditorPanel
-                clip={editingTextClip}
-                onSave={handleTextClipSave}
-                onClose={() => setEditingTextClip(null)}
-              />
-            </div>
+            <TextEditorPanel
+              clip={editingTextClip}
+              onSave={handleTextClipSave}
+              onClose={() => setEditingTextClip(null)}
+            />
+          </div>
           ) : showOrchestrator ? (
             <>
               {/* Resize handle for orchestrator panel */}

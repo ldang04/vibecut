@@ -154,3 +154,5 @@ if __name__ == "__main__":
         print("\n✗ Some tests failed. Make sure the ML service is running:")
         print("  cd ml/service && python main.py")
 
+
+

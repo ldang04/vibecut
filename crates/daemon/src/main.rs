@@ -12,6 +12,9 @@ mod jobs;
 mod llm;
 mod media;
 mod planner;
+mod orchestrator;
+mod retrieval;
+mod twelvelabs;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -49,6 +52,13 @@ async fn main() -> anyhow::Result<()> {
     let job_processor = jobs::processor::JobProcessor::new(db.clone(), job_manager.clone());
     let _processor_handle = tokio::spawn(async move {
         job_processor.run().await;
+    });
+
+    // Initialize and spawn agent event loop
+    let agent_db = db.clone();
+    let agent_job_manager = job_manager.clone();
+    let _agent_handle = tokio::spawn(async move {
+        orchestrator::events::agent_event_loop(agent_db, agent_job_manager).await;
     });
 
     // Build the router with CORS support

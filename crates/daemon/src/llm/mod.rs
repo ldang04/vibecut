@@ -94,3 +94,61 @@ pub async fn generate_edit_plan(
         Err(anyhow::anyhow!("ML service returned error: {}", response.status()))
     }
 }
+
+/// Generate agent response using LLM
+pub async fn generate_agent_response(
+    conversation_history: &[serde_json::Value],
+    project_state: &serde_json::Value,
+    context: &serde_json::Value,
+    event_type: &str,
+) -> Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let request_body = serde_json::json!({
+        "conversation_history": conversation_history,
+        "project_state": project_state,
+        "context": context,
+        "event_type": event_type,
+    });
+    
+    let response = client
+        .post(&format!("{}/orchestrator/generate_response", ML_SERVICE_URL))
+        .json(&request_body)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    if status.is_success() {
+        Ok(response.json().await?)
+    } else {
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        eprintln!("[ERROR] ML service returned error {}: {}", status, error_text);
+        Err(anyhow::anyhow!("ML service returned error {}: {}", status, error_text))
+    }
+}
+
+/// Parse user intent from natural language using LLM
+pub async fn parse_intent(
+    user_message: &str,
+    conversation_history: Option<&[serde_json::Value]>,
+) -> Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let mut request_body = serde_json::json!({
+        "user_message": user_message,
+    });
+    
+    if let Some(history) = conversation_history {
+        request_body["conversation_history"] = serde_json::json!(history);
+    }
+    
+    let response = client
+        .post(&format!("{}/orchestrator/parse_intent", ML_SERVICE_URL))
+        .json(&request_body)
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        Ok(response.json().await?)
+    } else {
+        Err(anyhow::anyhow!("ML service returned error: {}", response.status()))
+    }
+}

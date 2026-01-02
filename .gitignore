@@ -1,3 +1,4 @@
+.env
 cat > .gitignore <<'EOF'
 # Node
 node_modules

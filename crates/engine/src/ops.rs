@@ -35,6 +35,14 @@ pub enum TimelineOperation {
         position_ticks: i64,
         duration_ticks: i64,
     },
+    RippleInsertClipFromRange {
+        asset_id: i64,
+        segment_id: i64,        // For tracking which segment this came from
+        src_in_ticks: i64,      // Source in point
+        src_out_ticks: i64,     // Source out point
+        position_ticks: i64,    // Timeline position (will ripple)
+        track_id: i64,
+    },
     OverwriteClip {
         asset_id: i64,
         position_ticks: i64,
@@ -524,6 +532,66 @@ impl Timeline {
 
                 // Ensure contiguity after insertion
                 self.repack_primary_timeline();
+
+                Ok(())
+            }
+            TimelineOperation::RippleInsertClipFromRange {
+                asset_id,
+                segment_id: _segment_id, // Stored for tracking, but not used in ClipInstance (could be stored in metadata)
+                src_in_ticks,
+                src_out_ticks,
+                position_ticks,
+                track_id,
+            } => {
+                let duration_ticks = src_out_ticks - src_in_ticks;
+                
+                // Find or create the target track
+                let target_track = if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+                    t
+                } else {
+                    // Create new track
+                    let new_track = Track {
+                        id: track_id,
+                        kind: TrackKind::Video,
+                        clips: Vec::new(),
+                    };
+                    self.tracks.push(new_track);
+                    self.tracks.last_mut().unwrap()
+                };
+
+                // If this is the primary track (track_id == 1), ripple subsequent clips
+                if track_id == 1 {
+                    // Find all clips that start at or after the insertion point
+                    // Shift them right by duration_ticks
+                    for clip in &mut target_track.clips {
+                        if clip.timeline_start_ticks >= position_ticks {
+                            clip.timeline_start_ticks += duration_ticks;
+                        }
+                    }
+                }
+
+                // Create clip with exact source bounds
+                let new_clip = ClipInstance {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    asset_id,
+                    in_ticks: src_in_ticks,  // Exact source in point
+                    out_ticks: src_out_ticks, // Exact source out point
+                    timeline_start_ticks: position_ticks,
+                    speed: 1.0,
+                    track_id,
+                };
+
+                // Insert clip in sorted order by timeline_start_ticks
+                let insert_index = target_track.clips
+                    .iter()
+                    .position(|c| c.timeline_start_ticks > position_ticks)
+                    .unwrap_or(target_track.clips.len());
+                target_track.clips.insert(insert_index, new_clip);
+
+                // Ensure contiguity after insertion (only for primary track)
+                if track_id == 1 {
+                    self.repack_primary_timeline();
+                }
 
                 Ok(())
             }

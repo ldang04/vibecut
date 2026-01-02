@@ -9,6 +9,8 @@ sentence-transformers>=2.2.0
 open-clip-torch>=2.20.0
 torch>=2.0.0
 Pillow>=10.0.0
+openai>=1.0.0
+python-dotenv>=1.0.0
 # Note: av (PyAV) may fail to build with FFmpeg 8.0, but it's not used
 # If installation fails, install packages individually:
 # pip install fastapi==0.115.0 "uvicorn[standard]==0.32.0" "opencv-python>=4.10.0.82" "numpy>=2.0.0" pytesseract==0.3.13 "scipy>=1.13.0"

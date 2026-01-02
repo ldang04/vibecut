@@ -8,10 +8,16 @@ interface ProposeRequest {
   context?: any;
 }
 
+interface Suggestion {
+  label: string;
+  action: string;
+  confirm_token?: string | null;
+}
+
 interface AgentResponse<T> {
   mode: 'talk' | 'busy' | 'act';
   message: string;
-  suggestions: string[];
+  suggestions: Suggestion[];
   questions: string[];
   data?: T;
   debug?: any;
@@ -49,6 +55,37 @@ interface PlanRequest {
 interface ApplyRequest {
   edit_plan: any;
   confirm_token?: string;
+}
+
+export function useOrchestrator(projectId: number) {
+  const { propose, isLoading: isProposing } = usePropose(projectId);
+  const { generatePlan, isLoading: isGenerating } = useGeneratePlan(projectId);
+  const { applyPlan, isLoading: isApplying } = useApplyPlan(projectId);
+  
+  const getMessages = async (): Promise<any[]> => {
+    try {
+      const response = await fetch(`${API_BASE}/projects/${projectId}/orchestrator/messages`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      return data.messages || [];
+    } catch (error) {
+      console.error('Error fetching messages:', error);
+      return [];
+    }
+  };
+
+  return {
+    propose,
+    generatePlan,
+    applyPlan,
+    getMessages,
+    isProposing,
+    isGenerating,
+    isApplying,
+    isLoading: isProposing || isGenerating || isApplying,
+  };
 }
 
 export function usePropose(projectId: number) {

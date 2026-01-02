@@ -456,7 +456,7 @@ async fn import_raw(
             });
 
             let job_id = job_manager
-                .create_job(JobType::ImportRaw, Some(job_payload))
+                .create_job(JobType::ImportRaw, Some(job_payload), None)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
             job_ids.push(job_id);
@@ -494,7 +494,7 @@ async fn import_raw(
         });
 
         let job_id = job_manager
-            .create_job(JobType::ImportRaw, Some(job_payload))
+            .create_job(JobType::ImportRaw, Some(job_payload), None)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         // Spawn async task to process import
@@ -607,27 +607,35 @@ async fn process_single_video(
         "media_asset_id": asset_id,
         "input_path": video_path.to_str().unwrap(),
     });
-    let _proxy_job_id = job_manager.create_job(JobType::GenerateProxy, Some(proxy_job_payload))?;
+    let _proxy_job_id = job_manager.create_job(JobType::GenerateProxy, Some(proxy_job_payload), None)?;
 
     // Queue BuildSegments job (can run immediately)
     let build_segments_payload = json!({
         "asset_id": asset_id,
     });
-    let _build_segments_id = job_manager.create_job(JobType::BuildSegments, Some(build_segments_payload))?;
+    let _build_segments_id = job_manager.create_job(JobType::BuildSegments, Some(build_segments_payload), None)?;
 
     // Queue transcription job (runs in parallel)
     let transcribe_job_payload = json!({
         "asset_id": asset_id,
         "media_path": video_path.to_str().unwrap(),
     });
-    let _transcribe_job_id = job_manager.create_job(JobType::TranscribeAsset, Some(transcribe_job_payload))?;
+    let _transcribe_job_id = job_manager.create_job(JobType::TranscribeAsset, Some(transcribe_job_payload), None)?;
 
     // Queue vision analysis job (runs in parallel)
     let vision_job_payload = json!({
         "asset_id": asset_id,
         "media_path": video_path.to_str().unwrap(),
     });
-    let _vision_job_id = job_manager.create_job(JobType::AnalyzeVisionAsset, Some(vision_job_payload))?;
+    let _vision_job_id = job_manager.create_job(JobType::AnalyzeVisionAsset, Some(vision_job_payload), None)?;
+
+    // Queue TwelveLabs indexing job (will wait for embeddings to be ready via prerequisites)
+    let twelvelabs_index_payload = json!({
+        "asset_id": asset_id,
+        "project_id": project_id,
+    });
+    let dedupe_key = format!("IndexAssetWithTwelveLabs:{}", asset_id);
+    let _twelvelabs_index_job_id = job_manager.create_job(JobType::IndexAssetWithTwelveLabs, Some(twelvelabs_index_payload), Some(dedupe_key))?;
 
     // Update progress
     let progress = (idx + 1) as f64 / total_files as f64;

@@ -20,7 +20,7 @@ impl JobProcessor {
 
     /// Get pending jobs that are ready to run (prerequisites met)
     pub fn get_ready_jobs(&self) -> Result<Vec<i64>> {
-        let status_str = serde_json::to_string(&JobStatus::Pending)?;
+        let status_str = JobStatus::Pending.to_string();
         let rows: Vec<_> = {
             let conn = self.db.conn.lock().unwrap();
             let mut stmt = conn.prepare(
@@ -39,8 +39,9 @@ impl JobProcessor {
         
         let mut ready_jobs = Vec::new();
         for (job_id, job_type_str, payload_str) in rows {
-            // Parse job type
-            let job_type: JobType = serde_json::from_str(&job_type_str)?;
+            // Parse job type from plain string
+            let job_type = JobType::from_str(&job_type_str)
+                .map_err(|e| anyhow::anyhow!("Failed to parse job type: {}", e))?;
             
             // Check prerequisites based on job type
             if let Some(asset_id) = Self::extract_asset_id(&payload_str) {
@@ -117,6 +118,10 @@ impl JobProcessor {
             JobType::EmbedSegments => {
                 // Requires metadata_ready_at
                 db.check_asset_prerequisites(asset_id, &["metadata_ready"])
+            }
+            JobType::IndexAssetWithTwelveLabs => {
+                // Requires embeddings_ready_at (should come after EmbedSegments)
+                db.check_asset_prerequisites(asset_id, &["embeddings_ready"])
             }
             JobType::GenerateProxy => {
                 // Can run immediately (no prerequisites)
@@ -270,6 +275,29 @@ impl JobProcessor {
                     }
                 } else {
                     eprintln!("EmbedSegments job {} missing asset_id", job_id);
+                    let _ = self.job_manager.update_job_status(job_id, JobStatus::Failed, None);
+                }
+            }
+            JobType::IndexAssetWithTwelveLabs => {
+                if let Some(asset_id) = Self::extract_asset_id_from_payload(&job.payload) {
+                    let project_id = job.payload.as_ref()
+                        .and_then(|p| p.get("project_id"))
+                        .and_then(|v| v.as_i64())
+                        .ok_or_else(|| anyhow::anyhow!("Missing project_id"))?;
+                    
+                    if let Err(e) = crate::jobs::twelvelabs_index::process_index_asset_with_twelvelabs(
+                        self.db.clone(),
+                        self.job_manager.clone(),
+                        job_id,
+                        asset_id,
+                        project_id,
+                    ).await {
+                        eprintln!("Error processing IndexAssetWithTwelveLabs job {}: {:?}", job_id, e);
+                        let _ = self.job_manager.update_job_status(job_id, JobStatus::Failed, None);
+                        return Err(e);
+                    }
+                } else {
+                    eprintln!("IndexAssetWithTwelveLabs job {} missing asset_id", job_id);
                     let _ = self.job_manager.update_job_status(job_id, JobStatus::Failed, None);
                 }
             }

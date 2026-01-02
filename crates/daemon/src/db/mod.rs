@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Row};
 use std::path::Path;
 use std::sync::Mutex;
+use uuid::Uuid;
 
 pub struct Database {
     pub(crate) conn: Mutex<Connection>,
@@ -148,6 +149,72 @@ impl Database {
             );
             let _ = conn.execute(
                 "ALTER TABLE media_assets ADD COLUMN embeddings_ready_at TEXT",
+                [],
+            );
+        }
+
+        // Migration: Add TwelveLabs columns to projects table
+        let has_twelvelabs_index_id = conn
+            .prepare("SELECT twelvelabs_index_id FROM projects LIMIT 1")
+            .is_ok();
+        
+        if !has_twelvelabs_index_id {
+            let _ = conn.execute(
+                "ALTER TABLE projects ADD COLUMN twelvelabs_index_id TEXT NULL",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE projects ADD COLUMN twelvelabs_indexed_at TEXT NULL",
+                [],
+            );
+        }
+
+        // Migration: Add TwelveLabs columns to media_assets table
+        let has_twelvelabs_video_id = conn
+            .prepare("SELECT twelvelabs_video_id FROM media_assets LIMIT 1")
+            .is_ok();
+        
+        if !has_twelvelabs_video_id {
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN twelvelabs_video_id TEXT NULL",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN twelvelabs_task_id TEXT NULL",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN twelvelabs_indexed_at TEXT NULL",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE media_assets ADD COLUMN twelvelabs_last_error TEXT NULL",
+                [],
+            );
+        }
+
+        // Migration: Add dedupe_key and external columns to segments table
+        let has_dedupe_key = conn
+            .prepare("SELECT dedupe_key FROM segments LIMIT 1")
+            .is_ok();
+        
+        if !has_dedupe_key {
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN dedupe_key TEXT NULL",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN external_source TEXT NULL",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE segments ADD COLUMN external_ref TEXT NULL",
+                [],
+            );
+            
+            // Create unique index on dedupe_key (only for non-null values)
+            let _ = conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS segments_dedupe_key_unique ON segments(dedupe_key) WHERE dedupe_key IS NOT NULL",
                 [],
             );
         }
@@ -357,6 +424,29 @@ impl Database {
             [],
         )?;
 
+        // Migration: Add dedupe_key and is_active columns if they don't exist
+        let has_dedupe_key = conn
+            .prepare("SELECT dedupe_key FROM jobs LIMIT 1")
+            .is_ok();
+        
+        if !has_dedupe_key {
+            let _ = conn.execute(
+                "ALTER TABLE jobs ADD COLUMN dedupe_key TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE jobs ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+                [],
+            );
+            // Create unique index for active jobs with dedupe_key
+            let _ = conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_dedupe_active 
+                 ON jobs(dedupe_key) 
+                 WHERE dedupe_key IS NOT NULL AND is_active = 1",
+                [],
+            );
+        }
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS edit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -394,11 +484,24 @@ impl Database {
                 project_id INTEGER NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                metadata_json TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             )",
             [],
         )?;
+        
+        // Migration: Add metadata_json column if it doesn't exist
+        let has_metadata_json = conn
+            .prepare("SELECT metadata_json FROM orchestrator_messages LIMIT 1")
+            .is_ok();
+        
+        if !has_metadata_json {
+            let _ = conn.execute(
+                "ALTER TABLE orchestrator_messages ADD COLUMN metadata_json TEXT",
+                [],
+            );
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS orchestrator_proposals (
@@ -419,6 +522,39 @@ impl Database {
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS orchestrator_goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                user_intent TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS timeline_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER NOT NULL,
+                version_id TEXT NOT NULL,
+                parent_version_id TEXT,
+                is_current INTEGER NOT NULL DEFAULT 0,
+                json_blob TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )",
+            [],
+        )?;
+
+        // Create unique index for current version (only one current version per project)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS timeline_versions_current ON timeline_versions(project_id, is_current) WHERE is_current = 1",
             [],
         )?;
 
@@ -716,6 +852,48 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Get or create a dynamic segment (idempotent via dedupe_key)
+    pub fn get_or_create_dynamic_segment(
+        &self,
+        asset_id: i64,
+        project_id: i64,
+        start_ticks: i64,
+        end_ticks: i64,
+        dedupe_key: &str,
+        external_source: &str,
+        external_ref: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        
+        // Check if segment with dedupe_key exists
+        let existing_id: Result<i64, rusqlite::Error> = conn.query_row(
+            "SELECT id FROM segments WHERE dedupe_key = ?1",
+            params![dedupe_key],
+            |row| row.get(0),
+        );
+        
+        match existing_id {
+            Ok(segment_id) => Ok(segment_id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Create new segment
+                conn.execute(
+                    "INSERT INTO segments (
+                        project_id, media_asset_id, 
+                        src_in_ticks, src_out_ticks, start_ticks, end_ticks,
+                        segment_kind, dedupe_key, external_source, external_ref
+                    ) VALUES (?1, ?2, ?3, ?4, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        project_id, asset_id,
+                        start_ticks, end_ticks,
+                        "twelvelabs_dynamic", dedupe_key, external_source, external_ref
+                    ],
+                )?;
+                Ok(conn.last_insert_rowid())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Update segment metadata fields (enrichable fields)
     pub fn update_segment_metadata(
         &self,
@@ -927,6 +1105,33 @@ impl Database {
         Ok(true)
     }
 
+    pub fn get_media_asset(&self, asset_id: i64) -> Result<Option<MediaAssetInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, duration_ticks, fps_num, fps_den, width, height
+             FROM media_assets
+             WHERE id = ?1"
+        )?;
+        
+        let mut rows = stmt.query_map(params![asset_id], |row| {
+            Ok(MediaAssetInfo {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                duration_ticks: row.get(2)?,
+                fps_num: row.get(3)?,
+                fps_den: row.get(4)?,
+                width: row.get(5)?,
+                height: row.get(6)?,
+            })
+        })?;
+        
+        match rows.next() {
+            Some(Ok(asset)) => Ok(Some(asset)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     pub fn get_media_assets_for_project(&self, project_id: i64) -> Result<Vec<MediaAssetInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1009,51 +1214,118 @@ impl Database {
         }
     }
 
-    /// Store timeline for a project
+    /// Store timeline for a project (backward compatible - defaults to overwrite)
     pub fn store_timeline(&self, project_id: i64, timeline_json: &str) -> Result<()> {
+        self.store_timeline_version(project_id, timeline_json, None, false)
+    }
+
+    /// Store timeline version (new version or overwrite)
+    pub fn store_timeline_version(
+        &self,
+        project_id: i64,
+        timeline_json: &str,
+        parent_version_id: Option<&str>,
+        is_new_version: bool,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         
-        // Check if timeline already exists for this project
-        let existing = conn.query_row(
-            "SELECT id FROM timeline_projects WHERE project_id = ?1",
-            params![project_id],
-            |row| row.get::<_, i64>(0),
-        );
-        
-        match existing {
-            Ok(_id) => {
-                // Update existing
-                conn.execute(
-                    "UPDATE timeline_projects SET json_blob = ?1, updated_at = ?2 WHERE project_id = ?3",
-                    params![timeline_json, now, project_id],
-                )?;
+        if is_new_version {
+            // Create new version
+            let version_id = Uuid::new_v4().to_string();
+            
+            // Set previous current version to not current
+            conn.execute(
+                "UPDATE timeline_versions SET is_current = 0 WHERE project_id = ?1 AND is_current = 1",
+                params![project_id],
+            )?;
+            
+            // Insert new version as current
+            conn.execute(
+                "INSERT INTO timeline_versions (project_id, version_id, parent_version_id, is_current, json_blob, created_at) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                params![project_id, version_id, parent_version_id, timeline_json, now],
+            )?;
+        } else {
+            // Update existing current version (overwrite)
+            let existing = conn.query_row(
+                "SELECT id FROM timeline_versions WHERE project_id = ?1 AND is_current = 1",
+                params![project_id],
+                |row| row.get::<_, i64>(0),
+            );
+            
+            match existing {
+                Ok(_id) => {
+                    // Update existing current version
+                    conn.execute(
+                        "UPDATE timeline_versions SET json_blob = ?1 WHERE project_id = ?2 AND is_current = 1",
+                        params![timeline_json, project_id],
+                    )?;
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // No current version exists, create one
+                    let version_id = Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO timeline_versions (project_id, version_id, parent_version_id, is_current, json_blob, created_at) VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                        params![project_id, version_id, parent_version_id, timeline_json, now],
+                    )?;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // Insert new
-                conn.execute(
-                    "INSERT INTO timeline_projects (project_id, json_blob, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![project_id, timeline_json, now, now],
-                )?;
+            
+            // Also update timeline_projects for backward compatibility
+            let existing_legacy = conn.query_row(
+                "SELECT id FROM timeline_projects WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, i64>(0),
+            );
+            
+            match existing_legacy {
+                Ok(_id) => {
+                    conn.execute(
+                        "UPDATE timeline_projects SET json_blob = ?1, updated_at = ?2 WHERE project_id = ?3",
+                        params![timeline_json, now, project_id],
+                    )?;
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    conn.execute(
+                        "INSERT INTO timeline_projects (project_id, json_blob, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![project_id, timeline_json, now, now],
+                    )?;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         }
         
         Ok(())
     }
 
-    /// Get timeline for a project
+    /// Get timeline for a project (prefers timeline_versions, falls back to timeline_projects for backward compatibility)
     pub fn get_timeline(&self, project_id: i64) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT json_blob FROM timeline_projects WHERE project_id = ?1")?;
-        let mut rows = stmt.query_map(params![project_id], |row| {
-            Ok(row.get::<_, String>(0)?)
-        })?;
         
-        match rows.next() {
-            Some(Ok(blob)) => Ok(Some(blob)),
-            Some(Err(e)) => Err(e.into()),
-            None => Ok(None),
+        // Try timeline_versions first
+        let result: Result<String, rusqlite::Error> = conn.query_row(
+            "SELECT json_blob FROM timeline_versions WHERE project_id = ?1 AND is_current = 1",
+            params![project_id],
+            |row| row.get(0),
+        );
+        
+        match result {
+            Ok(blob) => Ok(Some(blob)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Fallback to timeline_projects for backward compatibility
+                let mut stmt = conn.prepare("SELECT json_blob FROM timeline_projects WHERE project_id = ?1")?;
+                let mut rows = stmt.query_map(params![project_id], |row| {
+                    Ok(row.get::<_, String>(0)?)
+                })?;
+                
+                match rows.next() {
+                    Some(Ok(blob)) => Ok(Some(blob)),
+                    Some(Err(e)) => Err(e.into()),
+                    None => Ok(None),
+                }
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1168,14 +1440,53 @@ impl Database {
         project_id: i64,
         role: &str,
         content: &str,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
+        let metadata_json = metadata.and_then(|m| serde_json::to_string(m).ok());
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO orchestrator_messages (project_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, role, content, now],
+            "INSERT INTO orchestrator_messages (project_id, role, content, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, role, content, metadata_json, now],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Get orchestrator messages for a project (most recent first)
+    pub fn get_orchestrator_messages(&self, project_id: i64, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT role, content, metadata_json, created_at FROM orchestrator_messages WHERE project_id = ?1 ORDER BY created_at DESC LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![project_id, limit as i64], |row| {
+            let role: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let metadata_json: Option<String> = row.get(2)?;
+            let created_at: String = row.get(3)?;
+            
+            let mut msg = serde_json::json!({
+                "role": role,
+                "content": content,
+                "created_at": created_at,
+            });
+            
+            if let Some(meta_str) = metadata_json {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                    msg["metadata"] = meta;
+                }
+            }
+            
+            Ok(msg)
+        })?;
+        
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        
+        // Reverse to get chronological order (oldest first)
+        messages.reverse();
+        Ok(messages)
     }
 
     /// Store orchestrator proposal
@@ -1206,5 +1517,132 @@ impl Database {
             params![project_id, edit_plan_json, now],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+    
+    /// Get the most recent edit plan for a project (from proposals or applies)
+    pub fn get_latest_edit_plan(&self, project_id: i64) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        
+        // First try to get from applies (most recent)
+        let mut stmt = conn.prepare(
+            "SELECT edit_plan_json FROM orchestrator_applies WHERE project_id = ?1 ORDER BY created_at DESC LIMIT 1"
+        )?;
+        
+        let mut rows = stmt.query_map(params![project_id], |row| {
+            let plan_json: String = row.get(0)?;
+            Ok(plan_json)
+        })?;
+        
+        if let Some(row) = rows.next() {
+            let plan_json = row?;
+            if let Ok(mut plan) = serde_json::from_str::<serde_json::Value>(&plan_json) {
+                // Enrich plan with segment semantic data
+                if let Some(primary_segments) = plan.get_mut("primary_segments").and_then(|v| v.as_array_mut()) {
+                    for segment_op in primary_segments {
+                        if let Some(segment_id) = segment_op.get("segment_id").and_then(|v| v.as_i64()) {
+                            // Get segment using get_segment_with_embeddings (we only need the segment part)
+                            if let Ok(Some((segment, _))) = self.get_segment_with_embeddings(segment_id) {
+                                // Add semantic description to the segment operation
+                                let description = segment.summary_text
+                                    .or_else(|| segment.transcript.clone())
+                                    .unwrap_or_else(|| {
+                                        // Fallback to scene tags or keywords
+                                        if let Some(scene_json) = &segment.scene_json {
+                                            if let Ok(scene) = serde_json::from_str::<serde_json::Value>(scene_json) {
+                                                if let Some(tags) = scene.get("tags").and_then(|t| t.as_array()) {
+                                                    let tag_str: Vec<String> = tags.iter()
+                                                        .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                                                        .collect();
+                                                    if !tag_str.is_empty() {
+                                                        return tag_str.join(", ");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        "video segment".to_string()
+                                    });
+                                
+                                segment_op["description"] = serde_json::json!(description);
+                                segment_op["duration_sec"] = serde_json::json!(
+                                    (segment.end_ticks - segment.start_ticks) as f64 / 48000.0
+                                );
+                            }
+                        }
+                    }
+                }
+                return Ok(Some(plan));
+            }
+        }
+        
+        // If no applied plan, check proposals (they might have plan data)
+        // For now, return None if no applied plan exists
+        // TODO: Store plan when generated, not just when applied
+        Ok(None)
+    }
+
+    /// Create orchestrator goal
+    pub fn create_orchestrator_goal(
+        &self,
+        project_id: i64,
+        user_intent: &str,
+        status: &str,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO orchestrator_goals (project_id, user_intent, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, user_intent, status, now, now],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Update orchestrator goal status
+    pub fn update_orchestrator_goal_status(
+        &self,
+        goal_id: i64,
+        status: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE orchestrator_goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status, now, goal_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get active goals for a project
+    pub fn get_active_orchestrator_goals(&self, project_id: i64) -> Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, user_intent, status FROM orchestrator_goals WHERE project_id = ?1 AND status NOT IN ('completed', 'cancelled') ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut goals = Vec::new();
+        for row in rows {
+            goals.push(row?);
+        }
+        Ok(goals)
+    }
+
+    /// Get goal by status
+    pub fn get_orchestrator_goal_by_status(
+        &self,
+        project_id: i64,
+        status: &str,
+    ) -> Result<Option<(i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT id, user_intent FROM orchestrator_goals WHERE project_id = ?1 AND status = ?2 ORDER BY created_at DESC LIMIT 1",
+            params![project_id, status],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(goal) => Ok(Some(goal)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }

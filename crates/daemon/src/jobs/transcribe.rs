@@ -46,6 +46,7 @@ pub async fn process_transcribe_asset(
     let _enrich_id = job_manager.create_job(
         crate::jobs::JobType::EnrichSegmentsFromTranscript,
         Some(enrich_payload),
+        None,
     )?;
     
     job_manager.update_job_status(job_id, crate::jobs::JobStatus::Completed, Some(1.0))?;

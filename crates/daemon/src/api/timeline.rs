@@ -12,6 +12,7 @@ use crate::db::Database;
 use engine::timeline::{Timeline, ProjectSettings, Resolution, TICKS_PER_SECOND};
 use engine::ops::TimelineOperation;
 use serde_json::{json, Value};
+use rusqlite::params;
 
 #[derive(Serialize)]
 pub struct TimelineResponse {
@@ -302,6 +303,77 @@ async fn apply_operations(
     Ok(Json(TimelineResponse {
         timeline: timeline_value,
     }))
+}
+
+/// Internal helper: apply operations to timeline (used by orchestrator)
+pub fn apply_ops_to_timeline(
+    db: &Database,
+    project_id: i64,
+    operations: Vec<TimelineOperation>,
+    is_new_version: bool,
+) -> Result<Timeline, anyhow::Error> {
+    // Load timeline from database
+    let timeline_json = db.get_timeline(project_id)?;
+
+    // Deserialize timeline or create default
+    let mut timeline: Timeline = if let Some(json_str) = timeline_json {
+        serde_json::from_str::<Timeline>(&json_str)
+            .unwrap_or_else(|_| {
+                // Create default timeline if deserialization fails
+                let settings = ProjectSettings {
+                    fps: 30.0,
+                    resolution: Resolution {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    sample_rate: 48000,
+                    ticks_per_second: TICKS_PER_SECOND,
+                };
+                Timeline::new(settings)
+            })
+    } else {
+        // Create default timeline if none exists
+        let settings = ProjectSettings {
+            fps: 30.0,
+            resolution: Resolution {
+                width: 1920,
+                height: 1080,
+            },
+            sample_rate: 48000,
+            ticks_per_second: TICKS_PER_SECOND,
+        };
+        Timeline::new(settings)
+    };
+
+    // Apply each operation
+    for op in operations {
+        timeline.apply_operation(op)
+            .map_err(|e| anyhow::anyhow!("Failed to apply operation: {}", e))?;
+    }
+
+    // Consolidate timeline to ensure contiguity
+    timeline.consolidate_timeline();
+
+    // Serialize and save updated timeline
+    let updated_timeline_json = serde_json::to_string(&timeline)?;
+    
+    // Get parent version ID if creating new version
+    let parent_version_id = if is_new_version {
+        // Get current version ID
+        let conn = db.conn.lock().unwrap();
+        let result: Result<String, rusqlite::Error> = conn.query_row(
+            "SELECT version_id FROM timeline_versions WHERE project_id = ?1 AND is_current = 1",
+            params![project_id],
+            |row| row.get(0),
+        );
+        result.ok()
+    } else {
+        None
+    };
+    
+    db.store_timeline_version(project_id, &updated_timeline_json, parent_version_id.as_deref(), is_new_version)?;
+
+    Ok(timeline)
 }
 
 async fn consolidate_timeline(
